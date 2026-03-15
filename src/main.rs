@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alexander R. Croft
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 mod config;
 mod process_manager;
 mod sink;
@@ -5,13 +8,42 @@ mod ui;
 mod web;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 use process_manager::ProcessManager;
 use sink::TelemetrySink;
 use std::net::SocketAddr;
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Parser, PartialEq, Eq)]
+#[command(
+    name = "rally",
+    version,
+    about = "Rally your services with a local process dashboard",
+    long_about = "Rally launches and supervises multiple local development processes, serves an embedded dashboard, and can optionally forward lifecycle and process output events to a ratatouille sink.",
+    after_help = "Examples:\n  rally\n  rally --config ./rally.toml\n  rally --sink http://127.0.0.1:9100/ingest\n  rally ./custom-rally.toml"
+)]
+struct CliArgs {
+    #[arg(
+        short = 'c',
+        long = "config",
+        value_name = "FILE",
+        help = "Path to the Rally config file",
+        conflicts_with = "config_path_positional"
+    )]
+    config_path: Option<PathBuf>,
+
+    #[arg(
+        value_name = "FILE",
+        help = "Legacy positional config path",
+        hide = true
+    )]
+    config_path_positional: Option<PathBuf>,
+
+    #[arg(long = "sink", value_name = "URL", help = "Optional ratatouille HTTP sink URL")]
+    sink_url: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
@@ -20,47 +52,22 @@ struct CliOptions {
 }
 
 fn parse_cli_args() -> Result<CliOptions> {
-    parse_cli_args_from(std::env::args_os().skip(1))
+    parse_cli_args_from(std::env::args_os())
 }
 
-fn parse_cli_args_from<I>(args: I) -> Result<CliOptions>
+fn parse_cli_args_from<I, T>(args: I) -> Result<CliOptions>
 where
-    I: IntoIterator<Item = OsString>,
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
 {
-    let mut args = args.into_iter();
-    let mut config_path: Option<PathBuf> = None;
-    let mut sink_url: Option<String> = None;
-
-    while let Some(arg) = args.next() {
-        let arg = arg.to_string_lossy().into_owned();
-
-        if arg == "--sink" {
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow!("--sink requires a URL"))?;
-            sink_url = Some(value.to_string_lossy().into_owned());
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix("--sink=") {
-            sink_url = Some(value.to_owned());
-            continue;
-        }
-
-        if arg.starts_with('-') {
-            return Err(anyhow!("Unknown argument: {}", arg));
-        }
-
-        if config_path.is_some() {
-            return Err(anyhow!("Multiple config paths provided"));
-        }
-
-        config_path = Some(PathBuf::from(arg));
-    }
+    let args = CliArgs::try_parse_from(args).map_err(|error| anyhow!(error.to_string()))?;
 
     Ok(CliOptions {
-        config_path: config_path.unwrap_or_else(|| PathBuf::from("rally.toml")),
-        sink_url,
+        config_path: args
+            .config_path
+            .or(args.config_path_positional)
+            .unwrap_or_else(|| PathBuf::from("rally.toml")),
+        sink_url: args.sink_url,
     })
 }
 
@@ -109,10 +116,10 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
 
-    web::spawn_health_checkers(&manager, &http_client).await;
-
     // Start all processes
     manager.start_all().await;
+    web::spawn_health_checkers(&manager, &http_client).await;
+    web::spawn_watch_tasks(&manager).await;
 
     info!("Rally dashboard available at http://{}", ui_addr);
     info!("Press Ctrl-C to stop all processes and exit.");
@@ -157,13 +164,14 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cli_args_from;
-    use std::ffi::OsString;
+    use super::{CliArgs, parse_cli_args_from};
+    use clap::CommandFactory;
     use std::path::PathBuf;
 
     fn parse_from(args: &[&str]) -> anyhow::Result<super::CliOptions> {
-        let args = args.iter().map(|value| OsString::from(*value)).collect::<Vec<_>>();
-        parse_cli_args_from(args)
+        let mut argv = vec!["rally"];
+        argv.extend_from_slice(args);
+        parse_cli_args_from(argv)
     }
 
     #[test]
@@ -175,15 +183,38 @@ mod tests {
 
     #[test]
     fn parses_sink_and_config_path() {
-        let cli = parse_from(&["--sink", "http://127.0.0.1:9000", "custom.toml"]).unwrap();
+        let cli = parse_from(&["--sink", "http://127.0.0.1:9000", "--config", "custom.toml"]).unwrap();
         assert_eq!(cli.config_path, PathBuf::from("custom.toml"));
         assert_eq!(cli.sink_url.as_deref(), Some("http://127.0.0.1:9000"));
     }
 
     #[test]
+    fn parses_legacy_positional_config_path() {
+        let cli = parse_from(&["custom.toml"]).unwrap();
+        assert_eq!(cli.config_path, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn rejects_multiple_config_sources() {
+        let error = parse_from(&["--config", "one.toml", "two.toml"]).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot be used with"));
+    }
+
+    #[test]
     fn rejects_unknown_flags() {
         let error = parse_from(&["--wat"]).unwrap_err();
-        assert!(format!("{error:#}").contains("Unknown argument"));
+        let message = format!("{error:#}");
+        assert!(message.contains("unexpected argument") || message.contains("unknown argument"));
+    }
+
+    #[test]
+    fn help_mentions_config_and_sink() {
+        let mut command = CliArgs::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("--config"));
+        assert!(help.contains("--sink"));
+        assert!(help.contains("Examples:"));
     }
 }
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alexander R. Croft
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use ratatouille::{Format, HttpSink, HttpSinkConfig, Logger, LoggerConfig, SourceIdentity};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
@@ -64,5 +67,27 @@ impl TelemetrySink {
                 let _ = logger.log(&topic, &message);
             }
         });
+    }
+
+    pub fn emit_process_output(&self, app_name: &str, stream: &str, line: &str) {
+        self.emit(
+            match stream {
+                "stdout" => "rally:stdout",
+                "stderr" => "rally:stderr",
+                _ => "rally:output",
+            },
+            format!("app={} {}", app_name, line),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TelemetrySink;
+
+    #[test]
+    fn disabled_sink_ignores_process_output() {
+        let sink = TelemetrySink::new(None);
+        sink.emit_process_output("api", "stdout", "hello");
     }
 }

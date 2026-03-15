@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alexander R. Croft
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -36,6 +39,8 @@ pub struct AppConfig {
     /// Commands to run after the process exits or is stopped.
     #[serde(default)]
     pub after: Vec<HookConfig>,
+    /// Optional watch settings used to restart this app when tracked files change.
+    pub watch: Option<WatchConfig>,
     /// Optional HTTP health-check URL polled periodically.
     pub health_url: Option<String>,
     /// Health-check interval in seconds (default: 10).
@@ -62,6 +67,20 @@ pub struct HookConfig {
     /// Environment variables injected into the hook.
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// File watching rules for automatic restarts.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WatchConfig {
+    /// Extra files or directories to watch.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Whether watched directories should be observed recursively.
+    #[serde(default = "default_watch_recursive")]
+    pub recursive: bool,
+    /// Debounce window before a restart is triggered.
+    #[serde(default = "default_watch_debounce_millis")]
+    pub debounce_millis: u64,
 }
 
 /// Embedded web-UI configuration.
@@ -97,6 +116,14 @@ fn default_health_interval() -> u64 {
 }
 
 fn default_log_lines() -> usize {
+    500
+}
+
+fn default_watch_recursive() -> bool {
+    true
+}
+
+fn default_watch_debounce_millis() -> u64 {
     500
 }
 
@@ -162,6 +189,17 @@ fn interpolate_config(mut config: Config) -> Result<Config> {
 
         for hook in &mut app.after {
             interpolate_hook(hook, &app_scope, &app.name, "after")?;
+        }
+
+        if let Some(watch) = &mut app.watch {
+            watch.paths = watch
+                .paths
+                .iter()
+                .map(|path| {
+                    interpolate_string(path, &app_scope)
+                        .with_context(|| format!("Failed to resolve watch path for app {}", app.name))
+                })
+                .collect::<Result<Vec<_>>>()?;
         }
     }
 
@@ -313,6 +351,7 @@ command = "/usr/bin/myapp"
         assert!(app.depends_on.is_empty());
         assert!(app.before.is_empty());
         assert!(app.after.is_empty());
+        assert!(app.watch.is_none());
         assert!(!app.restart_on_exit);
         assert_eq!(app.health_interval_secs, 10);
         assert_eq!(app.log_lines, 500);
@@ -360,6 +399,10 @@ MODE = "prepare"
 command = "./cleanup"
 args = ["--remove-lock"]
 workdir = "./tmp"
+
+[app.watch]
+paths = ["./config/dev.toml"]
+debounce_millis = 250
 "#;
         let cfg = parse(toml).unwrap();
         let app = &cfg.app[0];
@@ -371,6 +414,10 @@ workdir = "./tmp"
         assert_eq!(app.before[0].env["MODE"], "prepare");
         assert_eq!(app.after[0].command, "./cleanup");
         assert_eq!(app.after[0].workdir.as_deref(), Some("./tmp"));
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(watch.paths, vec!["./config/dev.toml"]);
+        assert_eq!(watch.debounce_millis, 250);
+        assert!(watch.recursive);
     }
 
     #[test]
@@ -438,6 +485,9 @@ args = ["${DATA_DIR}", "${HOOK_DIR}"]
 
 [app.before.env]
 HOOK_DIR = "${DATA_DIR}/hooks"
+
+[app.watch]
+paths = ["${DATA_DIR}/config.toml"]
 "#;
         let cfg = parse(toml).unwrap();
         let app = &cfg.app[0];
@@ -449,6 +499,10 @@ HOOK_DIR = "${DATA_DIR}/hooks"
         assert_eq!(app.env["DATA_DIR"], format!("{}/data", home));
         assert_eq!(app.before[0].args[0], format!("{}/data", home));
         assert_eq!(app.before[0].args[1], format!("{}/data/hooks", home));
+        assert_eq!(
+            app.watch.as_ref().unwrap().paths,
+            vec![format!("{}/data/config.toml", home)]
+        );
     }
 
     #[test]

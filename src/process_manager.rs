@@ -1,8 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Alexander R. Croft
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use crate::config::{AppConfig, HookConfig};
 use crate::sink::TelemetrySink;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
+use notify::{recommended_watcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -89,6 +94,10 @@ pub struct ProcessStatus {
     pub started_at: Option<DateTime<Utc>>,
     pub exit_time: Option<DateTime<Utc>>,
     pub restart_count: u32,
+    pub last_restart_reason: Option<String>,
+    pub watch_enabled: bool,
+    pub watch_paths: Vec<String>,
+    pub watch_debounce_millis: Option<u64>,
     pub logs: Vec<LogLine>,
 }
 
@@ -100,8 +109,10 @@ pub(crate) struct Inner {
     started_at: Option<DateTime<Utc>>,
     exit_time: Option<DateTime<Utc>>,
     restart_count: u32,
+    last_restart_reason: Option<String>,
     logs: VecDeque<LogLine>,
     pub(crate) max_log_lines: usize,
+    supervisor_active: bool,
     /// Sender used to kill the running process on demand.
     kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -142,8 +153,10 @@ impl ManagedProcess {
             started_at: None,
             exit_time: None,
             restart_count: 0,
+            last_restart_reason: None,
             logs: VecDeque::new(),
             max_log_lines: config.log_lines,
+            supervisor_active: false,
             kill_tx: None,
         }));
         Self {
@@ -157,6 +170,10 @@ impl ManagedProcess {
     /// Return a serialisable snapshot.
     pub async fn status(&self) -> ProcessStatus {
         let inner = self.inner.read().await;
+        let watch_targets = collect_watch_targets(&self.config)
+            .into_iter()
+            .map(|target| target.path.display().to_string())
+            .collect::<Vec<_>>();
         ProcessStatus {
             name: self.config.name.clone(),
             command: self.config.command.clone(),
@@ -168,6 +185,10 @@ impl ManagedProcess {
             started_at: inner.started_at,
             exit_time: inner.exit_time,
             restart_count: inner.restart_count,
+            last_restart_reason: inner.last_restart_reason.clone(),
+            watch_enabled: !watch_targets.is_empty(),
+            watch_paths: watch_targets,
+            watch_debounce_millis: self.config.watch.as_ref().map(|watch| watch.debounce_millis),
             logs: inner.logs.iter().cloned().collect(),
         }
     }
@@ -190,9 +211,22 @@ impl ManagedProcess {
         inner.logs.clear();
     }
 
+    pub async fn is_supervisor_active(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.supervisor_active
+    }
+
     /// Spawn (or re-spawn) the process and return immediately.
     /// A background task monitors the child process.
     pub async fn start(&self) {
+        {
+            let mut inner = self.inner.write().await;
+            if inner.supervisor_active {
+                return;
+            }
+            inner.supervisor_active = true;
+        }
+
         let inner_arc = self.inner.clone();
         let config = self.config.clone();
         let change_tx = self.change_tx.clone();
@@ -272,32 +306,26 @@ impl ManagedProcess {
 
                         // Capture stdout
                         if let Some(stdout) = child.stdout.take() {
-                            let inner_c = inner_arc.clone();
-                            let change_c = change_tx.clone();
-                            tokio::spawn(async move {
-                                let mut reader = BufReader::new(stdout).lines();
-                                while let Ok(Some(line)) = reader.next_line().await {
-                                    let mut inner = inner_c.write().await;
-                                    inner.push_log("stdout", line);
-                                    let _ = change_c.send(());
-                                    drop(inner);
-                                }
-                            });
+                            capture_process_output(
+                                config.name.clone(),
+                                "stdout",
+                                stdout,
+                                inner_arc.clone(),
+                                change_tx.clone(),
+                                telemetry.clone(),
+                            );
                         }
 
                         // Capture stderr
                         if let Some(stderr) = child.stderr.take() {
-                            let inner_c = inner_arc.clone();
-                            let change_c = change_tx.clone();
-                            tokio::spawn(async move {
-                                let mut reader = BufReader::new(stderr).lines();
-                                while let Ok(Some(line)) = reader.next_line().await {
-                                    let mut inner = inner_c.write().await;
-                                    inner.push_log("stderr", line);
-                                    let _ = change_c.send(());
-                                    drop(inner);
-                                }
-                            });
+                            capture_process_output(
+                                config.name.clone(),
+                                "stderr",
+                                stderr,
+                                inner_arc.clone(),
+                                change_tx.clone(),
+                                telemetry.clone(),
+                            );
                         }
 
                         // Wait for exit or kill signal
@@ -366,6 +394,7 @@ impl ManagedProcess {
                         {
                             inner.restart_count += 1;
                             let count = inner.restart_count;
+                            inner.last_restart_reason = Some(format!("auto-restart attempt {}", count));
                             telemetry.emit(
                                 "rally:process",
                                 format!("restarting {} attempt={}", config.name, count),
@@ -382,8 +411,19 @@ impl ManagedProcess {
                     }
                 }
             }
+
+            let mut inner = inner_arc.write().await;
+            inner.supervisor_active = false;
+            inner.kill_tx = None;
+            let _ = change_tx.send(());
         });
     }
+}
+
+#[derive(Clone)]
+struct WatchTarget {
+    path: PathBuf,
+    recursive: bool,
 }
 
 async fn run_hooks(
@@ -494,6 +534,23 @@ fn capture_hook_output(
     });
 }
 
+fn capture_process_output(
+    app_name: String,
+    stream: &'static str,
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    inner_arc: Arc<RwLock<Inner>>,
+    change_tx: broadcast::Sender<()>,
+    telemetry: Arc<TelemetrySink>,
+) {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            telemetry.emit_process_output(&app_name, stream, &line);
+            push_process_log(&inner_arc, &change_tx, stream, line).await;
+        }
+    });
+}
+
 async fn push_process_log(
     inner_arc: &Arc<RwLock<Inner>>,
     change_tx: &broadcast::Sender<()>,
@@ -509,13 +566,20 @@ async fn push_process_log(
 pub struct ProcessManager {
     pub processes: Vec<Arc<Mutex<ManagedProcess>>>,
     start_order: Vec<usize>,
+    index_by_name: HashMap<String, usize>,
     health_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    watch_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     telemetry: Arc<TelemetrySink>,
 }
 
 impl ProcessManager {
     pub fn new(configs: Vec<AppConfig>, telemetry: Arc<TelemetrySink>) -> Result<Self> {
         let start_order = resolve_start_order(&configs)?;
+        let index_by_name = configs
+            .iter()
+            .enumerate()
+            .map(|(index, config)| (config.name.clone(), index))
+            .collect();
         let processes = configs
             .into_iter()
             .map(|c| Arc::new(Mutex::new(ManagedProcess::new(c, telemetry.clone()))))
@@ -523,7 +587,9 @@ impl ProcessManager {
         Ok(Self {
             processes,
             start_order,
+            index_by_name,
             health_tasks: std::sync::Mutex::new(Vec::new()),
+            watch_tasks: std::sync::Mutex::new(Vec::new()),
             telemetry,
         })
     }
@@ -546,6 +612,38 @@ impl ProcessManager {
         }
     }
 
+    pub async fn restart_by_name(&self, name: &str, reason: &str) -> bool {
+        let Some(index) = self.index_by_name.get(name).copied() else {
+            return false;
+        };
+
+        self.restart_by_index(index, reason).await;
+        true
+    }
+
+    pub async fn restart_by_index(&self, index: usize, reason: &str) {
+        let proc = self.processes[index].clone();
+
+        {
+            let p = proc.lock().await;
+            {
+                let mut inner = p.inner.write().await;
+                inner.last_restart_reason = Some(reason.to_owned());
+                let _ = p.change_tx.send(());
+            }
+            p.telemetry.emit(
+                "rally:process",
+                format!("restart requested for {} reason={}", p.config.name, reason),
+            );
+            p.kill().await;
+        }
+
+        self.wait_for_shutdown(&proc).await;
+
+        let p = proc.lock().await;
+        p.start().await;
+    }
+
     pub fn register_health_task(&self, task: JoinHandle<()>) {
         let mut tasks = self.health_tasks.lock().unwrap();
         tasks.push(task);
@@ -553,6 +651,18 @@ impl ProcessManager {
 
     pub fn abort_health_tasks(&self) {
         let mut tasks = self.health_tasks.lock().unwrap();
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    pub fn register_watch_task(&self, task: JoinHandle<()>) {
+        let mut tasks = self.watch_tasks.lock().unwrap();
+        tasks.push(task);
+    }
+
+    pub fn abort_watch_tasks(&self) {
+        let mut tasks = self.watch_tasks.lock().unwrap();
         for task in tasks.drain(..) {
             task.abort();
         }
@@ -614,6 +724,188 @@ impl ProcessManager {
             }
         })
     }
+
+    pub fn spawn_watch_task(manager: SharedManager, index: usize) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let (config, telemetry) = {
+                let p = manager.processes[index].lock().await;
+                (p.config.clone(), p.telemetry.clone())
+            };
+
+            let watch_targets = collect_watch_targets(&config);
+            if watch_targets.is_empty() {
+                return;
+            }
+
+            let debounce_millis = config
+                .watch
+                .as_ref()
+                .map(|watch| watch.debounce_millis.max(50))
+                .unwrap_or(500);
+            let app_name = config.name.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+            let callback_name = app_name.clone();
+            let callback_telemetry = telemetry.clone();
+            let mut watcher = match recommended_watcher(move |result: notify::Result<notify::Event>| {
+                match result {
+                    Ok(event) => {
+                        if event.paths.is_empty() {
+                            let _ = tx.send(PathBuf::new());
+                        } else {
+                            for path in event.paths {
+                                let _ = tx.send(path);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(name = %callback_name, error = %error, "Watch error");
+                        callback_telemetry.emit(
+                            "rally:watch",
+                            format!("watch error for {}: {}", callback_name, error),
+                        );
+                    }
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    warn!(name = %app_name, error = %error, "Failed to create watcher");
+                    telemetry.emit(
+                        "rally:watch",
+                        format!("failed to create watcher for {}: {}", app_name, error),
+                    );
+                    return;
+                }
+            };
+
+            let mut watched_count = 0usize;
+            for target in watch_targets {
+                let mode = if target.recursive {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                };
+
+                match watcher.watch(&target.path, mode) {
+                    Ok(()) => watched_count += 1,
+                    Err(error) => {
+                        warn!(name = %app_name, path = %target.path.display(), error = %error, "Failed to watch path");
+                        telemetry.emit(
+                            "rally:watch",
+                            format!(
+                                "failed to watch {} for {}: {}",
+                                target.path.display(),
+                                app_name,
+                                error
+                            ),
+                        );
+                    }
+                }
+            }
+
+            if watched_count == 0 {
+                return;
+            }
+
+            telemetry.emit(
+                "rally:watch",
+                format!("watching {} target(s) for {}", watched_count, app_name),
+            );
+
+            while let Some(mut changed_path) = rx.recv().await {
+                let debounce = tokio::time::sleep(std::time::Duration::from_millis(debounce_millis));
+                tokio::pin!(debounce);
+
+                loop {
+                    tokio::select! {
+                        _ = &mut debounce => break,
+                        next = rx.recv() => match next {
+                            Some(path) => changed_path = path,
+                            None => return,
+                        }
+                    }
+                }
+
+                let reason = if changed_path.as_os_str().is_empty() {
+                    "watch change".to_owned()
+                } else {
+                    format!("watch change: {}", changed_path.display())
+                };
+
+                telemetry.emit(
+                    "rally:watch",
+                    format!("detected {} for {}", reason, app_name),
+                );
+                manager.restart_by_index(index, &reason).await;
+            }
+        })
+    }
+
+    async fn wait_for_shutdown(&self, proc: &Arc<Mutex<ManagedProcess>>) {
+        for _ in 0..50 {
+            let p = proc.lock().await;
+            let active = p.is_supervisor_active().await;
+            drop(p);
+            if !active {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+fn collect_watch_targets(config: &AppConfig) -> Vec<WatchTarget> {
+    let mut targets = HashMap::<PathBuf, bool>::new();
+
+    if let Some(watch) = &config.watch {
+        for path in &watch.paths {
+            insert_watch_target(&mut targets, resolve_watch_path(config, path), watch.recursive);
+        }
+    }
+
+    if looks_like_local_path(&config.command) {
+        insert_watch_target(&mut targets, resolve_watch_path(config, &config.command), false);
+    }
+
+    targets
+        .into_iter()
+        .map(|(path, recursive)| WatchTarget { path, recursive })
+        .collect()
+}
+
+fn insert_watch_target(targets: &mut HashMap<PathBuf, bool>, path: PathBuf, recursive: bool) {
+    let (watch_path, watch_recursive) = normalize_watch_target(path, recursive);
+    targets
+        .entry(watch_path)
+        .and_modify(|existing| *existing = *existing || watch_recursive)
+        .or_insert(watch_recursive);
+}
+
+fn normalize_watch_target(path: PathBuf, recursive: bool) -> (PathBuf, bool) {
+    if path.exists() {
+        return (path.clone(), recursive && path.is_dir());
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && parent.exists() {
+            return (parent.to_path_buf(), false);
+        }
+    }
+
+    (path, false)
+}
+
+fn resolve_watch_path(config: &AppConfig, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path);
+    if path.is_relative() {
+        if let Some(workdir) = &config.workdir {
+            return Path::new(workdir).join(path);
+        }
+    }
+    path
+}
+
+fn looks_like_local_path(command: &str) -> bool {
+    command.starts_with('.') || Path::new(command).components().count() > 1
 }
 
 fn resolve_start_order(configs: &[AppConfig]) -> Result<Vec<usize>> {
@@ -685,8 +977,8 @@ fn resolve_start_order(configs: &[AppConfig]) -> Result<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_start_order;
-    use crate::config::AppConfig;
+    use super::{collect_watch_targets, resolve_start_order};
+    use crate::config::{AppConfig, WatchConfig};
     use crate::sink::TelemetrySink;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -701,6 +993,7 @@ mod tests {
             depends_on: depends_on.iter().map(|value| (*value).to_owned()).collect(),
             before: Vec::new(),
             after: Vec::new(),
+            watch: None,
             health_url: None,
             health_interval_secs: 10,
             restart_on_exit: false,
@@ -741,6 +1034,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(manager.processes.len(), 1);
+    }
+
+    #[test]
+    fn collects_watch_targets_from_watch_paths_and_command() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "rally-watch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(temp_root.join("config")).unwrap();
+        std::fs::create_dir_all(temp_root.join("target/debug")).unwrap();
+
+        let mut app = app("api", &[]);
+        app.workdir = Some(temp_root.display().to_string());
+        app.command = "./target/debug/api".to_owned();
+        app.watch = Some(WatchConfig {
+            paths: vec!["config/dev.toml".to_owned()],
+            recursive: true,
+            debounce_millis: 500,
+        });
+
+        let targets = collect_watch_targets(&app)
+            .into_iter()
+            .map(|target| target.path)
+            .collect::<Vec<_>>();
+
+        assert!(targets.contains(&temp_root.join("config")));
+        assert!(targets.contains(&temp_root.join("target/debug")));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }
 

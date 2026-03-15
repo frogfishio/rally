@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alexander R. Croft
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /// Returns the embedded HTML/JS dashboard page.
 pub fn dashboard_html() -> &'static str {
     r#"<!DOCTYPE html>
@@ -368,15 +371,22 @@ function renderEnv(env) {
 
 function renderInfoTable(proc) {
   const sc = stateClass(proc.state);
+  const watchPaths = (proc.watch_paths || []).length
+    ? proc.watch_paths.map(escHtml).join('<br>')
+    : '—';
   return `
   <table class="info-table">
     <tr><td>State</td><td><span class="badge ${sc}">${stateLabel(proc.state)}</span></td></tr>
     <tr><td>PID</td><td>${proc.pid || '—'}</td></tr>
     <tr><td>Restarts</td><td>${proc.restart_count}</td></tr>
+    <tr><td>Last restart</td><td>${proc.last_restart_reason ? escHtml(proc.last_restart_reason) : '—'}</td></tr>
     <tr><td>Started</td><td>${fmtTs(proc.started_at)}</td></tr>
     <tr><td>Uptime</td><td>${proc.started_at && sc === 'running' ? elapsedSince(proc.started_at) : '—'}</td></tr>
     <tr><td>Exit time</td><td>${fmtTs(proc.exit_time)}</td></tr>
     <tr><td>Health</td><td><span class="badge ${healthClass(proc.health)}">${proc.health}</span></td></tr>
+    <tr><td>Watching</td><td>${proc.watch_enabled ? 'enabled' : 'disabled'}</td></tr>
+    <tr><td>Watch debounce</td><td>${proc.watch_debounce_millis ? proc.watch_debounce_millis + 'ms' : '—'}</td></tr>
+    <tr><td>Watch paths</td><td>${watchPaths}</td></tr>
     <tr><td>Command</td><td>${escHtml(proc.command)}</td></tr>
     <tr><td>Args</td><td>${proc.args.length ? proc.args.map(escHtml).join(' ') : '—'}</td></tr>
   </table>`;

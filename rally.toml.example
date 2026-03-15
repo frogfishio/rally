@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Alexander R. Croft
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # rally.toml — example configuration for the `rally` dev helper
 #
 # Run with: rally [path/to/rally.toml]
@@ -25,6 +28,11 @@ restart_on_exit = false
 health_url      = "http://localhost:8080/health"   # remove if not applicable
 health_interval_secs = 10
 log_lines = 500
+
+[app.watch]
+paths = ["./config/development.toml", "./migrations"]
+recursive = true
+debounce_millis = 750
 
 [[app.before]]
 command = "echo"

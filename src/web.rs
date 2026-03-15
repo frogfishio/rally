@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alexander R. Croft
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use crate::config;
 use crate::process_manager::SharedManager;
 use crate::sink::TelemetrySink;
@@ -55,7 +58,6 @@ impl AppState {
             cfg.app.clone(),
             self.telemetry.clone(),
         )?);
-        spawn_health_checkers(&new_manager, &self.http_client).await;
 
         let mut manager = self.manager.write().await;
         let old_manager = std::mem::replace(&mut *manager, new_manager.clone());
@@ -63,8 +65,11 @@ impl AppState {
 
         old_manager.kill_all().await;
         old_manager.abort_health_tasks();
+        old_manager.abort_watch_tasks();
         tokio::time::sleep(Duration::from_millis(300)).await;
         new_manager.start_all().await;
+        spawn_health_checkers(&new_manager, &self.http_client).await;
+        spawn_watch_tasks(&new_manager).await;
         self.telemetry.emit("rally:lifecycle", "reload complete".to_owned());
 
         Ok(())
@@ -74,6 +79,7 @@ impl AppState {
         let manager = self.current_manager().await;
         manager.kill_all().await;
         manager.abort_health_tasks();
+        manager.abort_watch_tasks();
     }
 }
 
@@ -88,6 +94,13 @@ pub async fn spawn_health_checkers(manager: &SharedManager, http_client: &reqwes
             );
             manager.register_health_task(task);
         }
+    }
+}
+
+pub async fn spawn_watch_tasks(manager: &SharedManager) {
+    for index in 0..manager.processes.len() {
+        let task = crate::process_manager::ProcessManager::spawn_watch_task(manager.clone(), index);
+        manager.register_watch_task(task);
     }
 }
 
@@ -133,17 +146,8 @@ async fn restart_handler(
     State(state): State<SharedAppState>,
 ) -> impl IntoResponse {
     let mgr = state.current_manager().await;
-    for proc in &mgr.processes {
-        let p = proc.lock().await;
-        if p.config.name == name {
-            p.kill().await;
-            // Small delay so kill propagates before restart
-            drop(p);
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let p = proc.lock().await;
-            p.start().await;
-            return StatusCode::OK;
-        }
+    if mgr.restart_by_name(&name, "manual restart").await {
+        return StatusCode::OK;
     }
     StatusCode::NOT_FOUND
 }

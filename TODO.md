@@ -6,7 +6,7 @@
 - [x] add ENV interpolation 
 - [x] add suppport for pkg:cargo/ratatouille@0.1.0, send all messages there
 - [x] add command line for teling where the sink is (url)... keep in mind that the sink may be one of the apps running, so it might not be available until we start it --sink http://..
-- [ ] after pkg:cargo/ratatouille@0.1.0 is implemented for the app, add support for capturing stdout/stderr from running apps and forwarding them to sink
-- [ ] add watch ability if a config for a running file has changed or the binary has changed restart it so we need to have an optional watch group for the tasks
-- [ ] add world-class command line wit --help etc
-- [ ] add command line config file specifying where to load it from
+- [x] after pkg:cargo/ratatouille@0.1.0 is implemented for the app, add support for capturing stdout/stderr from running apps and forwarding them to sink
+- [x] add watch ability if a config for a running file has changed or the binary has changed restart it so we need to have an optional watch group for the tasks
+- [x] add world-class command line wit --help etc
+- [x] add command line config file specifying where to load it from

@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: 2026 Alexander R. Croft -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+
 # Rally
 
 Rally is a Rust development helper that reads `rally.toml`, launches all your apps as child processes (not services), and gives you a clean embedded web dashboard so you can rally your services, see what's running, check health, view live logs, and restart or kill processes without console chaos.
@@ -12,6 +15,7 @@ Rally is a Rust development helper that reads `rally.toml`, launches all your ap
 - **ENV interpolation** — use `${VAR}` in commands, args, workdirs, URLs, and env values.
 - **Config reload** — reload `rally.toml` from the UI or API without restarting the Rally server.
 - **Optional telemetry sink** — pass `--sink http://...` to forward Rally lifecycle events to a ratatouille HTTP sink; if the sink is absent or unavailable, Rally keeps running.
+- **Watch groups** — optionally watch files, config, or local binaries and restart the affected app after a debounce window.
 - **Embedded web UI** at `http://127.0.0.1:7700` (configurable) — no external tools needed.
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
 - **Log viewer** — per-process stdout/stderr capture with filter and auto-scroll.
@@ -43,16 +47,29 @@ cargo build --release
 # Start with the default rally.toml in the current directory
 rally
 
-# Or point at a specific file
+# Or point at a specific file explicitly
+rally --config /path/to/my/rally.toml
+
+# Legacy positional config path still works
 rally /path/to/my/rally.toml
 
 # Or forward Rally lifecycle events to an optional HTTP sink
 rally --sink http://127.0.0.1:9100/ingest
+
+# Show CLI help
+rally --help
 ```
 
 Then open **http://127.0.0.1:7700** in your browser.
 
-When `--sink` is configured, Rally emits its own lifecycle and process events to a ratatouille-compatible HTTP sink in NDJSON format. Managed app stdout and stderr are still kept local for now; forwarding those remains a separate feature.
+When `--sink` is configured, Rally emits its own lifecycle and process events plus managed app stdout and stderr to a ratatouille-compatible HTTP sink in NDJSON format. If the sink is absent or unreachable, Rally continues running and simply drops that outbound telemetry.
+
+Sink topics currently use this shape:
+
+- `rally:lifecycle` for startup, shutdown, and reload messages
+- `rally:process` for process lifecycle and restart messages
+- `rally:watch` for watcher setup and file-change messages
+- `rally:stdout` and `rally:stderr` for forwarded app output
 
 ---
 
@@ -75,6 +92,11 @@ restart_on_exit      = false           # auto-restart when process exits (defaul
 health_url           = "http://localhost:8080/health"  # optional HTTP health check
 health_interval_secs = 10             # poll interval in seconds (default: 10)
 log_lines            = 500            # lines of log to keep in memory (default: 500)
+
+[app.watch]
+paths = ["./config/development.toml", "./migrations"]
+recursive = true
+debounce_millis = 750
 
 [[app.before]]
 command = "cargo"
@@ -113,6 +135,17 @@ API_URL   = "http://${HOST}:8080"
 
 `ENV` interpolation uses `${VAR}` syntax. Rally resolves values from the current process environment first, then app and hook `env` entries with deterministic cycle detection and unknown-variable errors.
 
+`[app.watch]` is optional. Rally watches the configured paths plus any local command path such as `./target/debug/api-server`, debounces rapid changes, and restarts only the affected app.
+
+Watch path normalization is deterministic:
+
+- Relative watch paths are resolved against `workdir` when present, otherwise against Rally's current working directory.
+- Relative local command paths such as `./target/debug/api-server` are watched automatically even if `watch.paths` is empty.
+- If a watched file does not exist yet but its parent directory does, Rally watches the parent directory non-recursively so future writes can still trigger a restart.
+- Directory watches honor `recursive = true`; file watches are always non-recursive.
+
+The dashboard `Info` tab now shows whether watching is enabled, the normalized watch paths Rally registered, and the last restart reason observed for that app.
+
 See [`rally.toml.example`](rally.toml.example) for a full example.
 
 ---
@@ -134,4 +167,4 @@ The embedded server also exposes a simple JSON API:
 
 ## License
 
-MIT
+GPL-3.0-or-later
