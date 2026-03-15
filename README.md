@@ -37,6 +37,14 @@ For a day-to-day operator view, see [USER_GUIDE.md](USER_GUIDE.md).
 cargo install --path .
 ```
 
+For crates.io, install the published package as:
+
+```sh
+cargo install frogfish-rally
+```
+
+The published crate name is `frogfish-rally`, while the installed command remains `rally`.
+
 Or build directly:
 
 ```

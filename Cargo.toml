@@ -2,11 +2,33 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [package]
-name = "rally"
+name = "frogfish-rally"
 version = "5.0.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Rally your services with an embedded development dashboard"
 license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/frogfishio/start"
+homepage = "https://github.com/frogfishio/start"
+keywords = ["process-manager", "supervisor", "dashboard", "devtools", "watcher"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+	"src/**/*",
+	"Cargo.toml",
+	"Cargo.lock",
+	"README.md",
+	"LICENSE",
+	"VERSION",
+	"BUILD",
+	"build.rs",
+	"rally.toml.example",
+	"USER_GUIDE.md",
+]
+
+[[bin]]
+name = "rally"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1.44", features = ["full"] }
