@@ -1,0 +1,237 @@
+<!-- SPDX-FileCopyrightText: 2026 Alexander R. Croft -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+
+# Rally User Guide
+
+Rally is a local control panel for a group of development apps. You start Rally, open the dashboard in a browser, and use it to see what is running, inspect health, read logs, and restart or stop individual apps when needed.
+
+This guide is for people using Rally day to day. It focuses on what to do, what to expect, and where to look when something is wrong.
+
+---
+
+## What Rally Does
+
+Rally reads a `rally.toml` file and starts the apps listed there.
+
+Once Rally is running, it gives you:
+
+- A browser dashboard showing all managed apps.
+- Live status for each app.
+- Health indicators when an app has a health check configured.
+- Per-app logs.
+- Restart and stop controls.
+- Config reload without restarting Rally itself.
+
+Rally manages local child processes. It is not a service manager and it does not install anything into your operating system.
+
+---
+
+## Starting Rally
+
+In the directory that contains your `rally.toml` file, run:
+
+```sh
+rally
+```
+
+If the config file is somewhere else, run:
+
+```sh
+rally --config /path/to/rally.toml
+```
+
+Then open the dashboard in your browser. By default, Rally serves it at:
+
+```text
+http://127.0.0.1:7700
+```
+
+If your setup uses a different host or port, use the address configured in `rally.toml`.
+
+---
+
+## First Look at the Dashboard
+
+Each app appears as its own card.
+
+On each card you can usually see:
+
+- The app name.
+- Whether it is running, stopped, exited, or unhealthy.
+- Its process ID while running.
+- Restart count.
+- Uptime.
+- Quick actions such as restart or kill.
+
+Selecting an app opens more detail, including logs, environment values, and operational information.
+
+---
+
+## Common Tasks
+
+### Restart an App
+
+Use the restart control for the app when you want Rally to stop it and start it again.
+
+This is useful when:
+
+- The app is stuck.
+- A watched file changed and you want to force a fresh run.
+- You changed something outside the configured watch paths.
+
+### Stop an App
+
+Use the kill control to terminate just that app.
+
+If the app is configured with automatic restart on exit, Rally may bring it back. In that case, killing it is not the same as disabling it permanently.
+
+### Reload Configuration
+
+Use the reload action when `rally.toml` has changed and you want Rally to pick up the new settings.
+
+Reloading configuration does not restart the Rally web dashboard itself, but it can restart managed apps so the new configuration takes effect.
+
+### Read Logs
+
+Open the Logs view for an app to see the stdout and stderr output Rally has captured.
+
+Use this first when an app:
+
+- Fails to start.
+- Keeps restarting.
+- Reports unhealthy.
+- Looks idle when it should be doing work.
+
+### Check Why Something Restarted
+
+Open the Info view for the app.
+
+Rally shows the last restart reason there, along with watch status and the watch paths it registered.
+
+---
+
+## Status Meanings
+
+The exact wording can vary by app state, but these are the main states to expect:
+
+- `running`: the app process is active.
+- `stopped`: the app is not currently running.
+- `exited`: the app ran and then ended.
+- `unhealthy`: the app process may still be running, but its configured health check is failing.
+
+An unhealthy app is often still alive as a process. It usually means the app is not responding correctly on its health endpoint.
+
+---
+
+## Health Checks
+
+Some apps have a health check configured. When they do, Rally polls the configured URL and shows the result in the dashboard.
+
+If an app shows unhealthy:
+
+1. Open its logs.
+2. Check whether the app has fully started yet.
+3. Confirm the expected port or URL is correct.
+4. Restart the app if needed.
+
+If the app is actually working but still shows unhealthy, the configured health URL may be wrong or too strict for that app.
+
+---
+
+## Watched Files and Automatic Restarts
+
+Some apps are configured to restart automatically when files or directories change.
+
+If watching is enabled for an app, Rally can restart it after changes such as:
+
+- A local binary being rebuilt.
+- A config file being updated.
+- A watched directory receiving new or changed files.
+
+Rally uses a debounce delay, so rapid bursts of file changes are grouped together instead of causing repeated restarts immediately.
+
+If an app is restarting unexpectedly, check the Info view first. It shows whether watching is enabled and which paths Rally is watching.
+
+---
+
+## When an App Does Not Start
+
+Start with these checks:
+
+1. Open the app logs in the dashboard.
+2. Confirm the command or binary actually exists on your machine.
+3. Confirm any required dependencies are available.
+4. Reload the config if `rally.toml` has changed.
+5. Restart the app manually from the dashboard.
+
+Possible reasons include:
+
+- The executable path is wrong.
+- The app needs environment variables that are missing.
+- A `before` hook failed.
+- A dependency app failed to start first.
+- The app exits immediately by design or due to an error.
+
+---
+
+## When Rally Starts but Nothing Happens
+
+If the dashboard opens but no apps are running:
+
+1. Confirm the `rally.toml` file contains `[[app]]` entries.
+2. Make sure you started Rally in the directory you expected, or used `--config`.
+3. Reload the config after any changes.
+4. Check the terminal where Rally itself was started for startup messages.
+
+---
+
+## Useful Commands
+
+```sh
+# Start with the default rally.toml in the current directory
+rally
+
+# Start with an explicit config file
+rally --config /path/to/rally.toml
+
+# Show help
+rally --help
+
+# Show version and build number
+rally --version
+
+# Show copyright and license summary
+rally --license
+```
+
+If your environment uses an optional sink endpoint for telemetry forwarding, you may also see Rally started with `--sink URL`. You do not need that flag unless your setup specifically uses it.
+
+---
+
+## What Rally Will Not Do
+
+Rally is intentionally focused on local process supervision.
+
+It does not:
+
+- Replace your deployment system.
+- Install background services into the OS.
+- Keep logs forever.
+- Fix application-level errors automatically.
+
+If an app is broken, Rally helps you see that clearly and restart it, but the app still needs to be fixed at the source.
+
+---
+
+## Quick Routine
+
+For normal daily use, the typical flow is:
+
+1. Run `rally`.
+2. Open the dashboard.
+3. Confirm your apps are running and healthy.
+4. Use logs when something looks wrong.
+5. Use restart for individual apps.
+6. Use reload when `rally.toml` changes.
+
+That is the core loop for operating Rally day to day.

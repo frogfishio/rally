@@ -5,6 +5,8 @@
 
 Rally is a Rust development helper that reads `rally.toml`, launches all your apps as child processes (not services), and gives you a clean embedded web dashboard so you can rally your services, see what's running, check health, view live logs, and restart or kill processes without console chaos.
 
+For a day-to-day operator view, see [USER_GUIDE.md](USER_GUIDE.md).
+
 ---
 
 ## Features
@@ -15,9 +17,12 @@ Rally is a Rust development helper that reads `rally.toml`, launches all your ap
 - **ENV interpolation** — use `${VAR}` in commands, args, workdirs, URLs, and env values.
 - **Config reload** — reload `rally.toml` from the UI or API without restarting the Rally server.
 - **Optional telemetry sink** — pass `--sink http://...` to forward Rally lifecycle events to a ratatouille HTTP sink; if the sink is absent or unavailable, Rally keeps running.
+- **Output forwarding** — forward managed app stdout and stderr to the optional sink while still keeping in-memory logs in the dashboard.
 - **Watch groups** — optionally watch files, config, or local binaries and restart the affected app after a debounce window.
+- **CLI surface** — built-in `--help`, `--version`, `--license`, explicit `--config`, optional `--sink`, and legacy positional config compatibility.
 - **Embedded web UI** at `http://127.0.0.1:7700` (configurable) — no external tools needed.
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
+- **Operational visibility** — the dashboard `Info` tab shows watch status, normalized watch paths, and the last restart reason for each app.
 - **Log viewer** — per-process stdout/stderr capture with filter and auto-scroll.
 - **Kill / Restart** — one-click stop or restart of individual processes from the UI.
 - **Auto-restart** — optional `restart_on_exit = true` to keep processes alive.
@@ -45,7 +50,8 @@ For local release helpers:
 # Increment the patch component in VERSION and sync Cargo.toml package version
 make bump
 
-# Increment BUILD, run a release build, and copy the binary to dist/<os>-<arch>/bin
+# Increment BUILD, run a release build, copy the binary to dist/<os>-<arch>/bin,
+# and package the user guide, README, LICENSE, and example config into dist/<os>-<arch>/
 make dist
 
 # Delete Cargo build artifacts under target/
@@ -84,6 +90,28 @@ rally --license
 
 Then open **http://127.0.0.1:7700** in your browser.
 
+## CLI
+
+Rally's command line is intentionally small and explicit:
+
+- `rally` starts using `rally.toml` in the current directory.
+- `rally --config /path/to/rally.toml` selects a config file directly.
+- `rally /path/to/rally.toml` remains supported for positional compatibility.
+- `rally --sink http://127.0.0.1:9100/ingest` enables best-effort ratatouille forwarding.
+- `rally --help` prints the full command reference.
+- `rally --version` prints the build version in `VERSION+build.BUILD` form.
+- `rally --license` prints the copyright and license summary.
+
+The sink is optional by design. If it is not reachable yet, Rally still starts, supervises processes, and simply drops outbound sink messages until delivery is possible.
+
+## Reload, Dependencies, and Hooks
+
+Rally can reload configuration in place through the dashboard or `POST /api/reload` without restarting the Rally web server itself.
+
+`depends_on` is enforced for both startup and shutdown. Dependencies start first, dependents stop first, and invalid dependency graphs are rejected before processes are launched.
+
+`before` hooks run in order and must succeed before Rally starts the app. `after` hooks run in order after the app exits or is stopped. Hook environment inherits the app `env` and can add or override values with `before.env` or `after.env`.
+
 When `--sink` is configured, Rally emits its own lifecycle and process events plus managed app stdout and stderr to a ratatouille-compatible HTTP sink in NDJSON format. If the sink is absent or unreachable, Rally continues running and simply drops that outbound telemetry.
 
 Sink topics currently use this shape:
@@ -92,6 +120,19 @@ Sink topics currently use this shape:
 - `rally:process` for process lifecycle and restart messages
 - `rally:watch` for watcher setup and file-change messages
 - `rally:stdout` and `rally:stderr` for forwarded app output
+
+## Watching and Restart Behavior
+
+`[app.watch]` is optional. Rally watches the configured paths plus any local command path such as `./target/debug/api-server`, debounces rapid changes, and restarts only the affected app.
+
+Watch path normalization is deterministic:
+
+- Relative watch paths are resolved against `workdir` when present, otherwise against Rally's current working directory.
+- Relative local command paths such as `./target/debug/api-server` are watched automatically even if `watch.paths` is empty.
+- If a watched file does not exist yet but its parent directory does, Rally watches the parent directory non-recursively so future writes can still trigger a restart.
+- Directory watches honor `recursive = true`; file watches are always non-recursive.
+
+The dashboard `Info` tab shows whether watching is enabled, the normalized watch paths Rally registered, and the last restart reason observed for that app.
 
 ---
 
@@ -151,22 +192,9 @@ HOST      = "127.0.0.1"
 API_URL   = "http://${HOST}:8080"
 ```
 
-`before` hooks run in order and must succeed before Rally starts the app. `after` hooks run in order after the app exits or is stopped. Hook environment inherits the app `env` and can add or override values with `before.env` or `after.env`.
-
 `depends_on = ["database", "api-server"]` starts dependencies first and stops dependents first on shutdown. Rally validates that dependency names exist, are unique, and do not form cycles.
 
 `ENV` interpolation uses `${VAR}` syntax. Rally resolves values from the current process environment first, then app and hook `env` entries with deterministic cycle detection and unknown-variable errors.
-
-`[app.watch]` is optional. Rally watches the configured paths plus any local command path such as `./target/debug/api-server`, debounces rapid changes, and restarts only the affected app.
-
-Watch path normalization is deterministic:
-
-- Relative watch paths are resolved against `workdir` when present, otherwise against Rally's current working directory.
-- Relative local command paths such as `./target/debug/api-server` are watched automatically even if `watch.paths` is empty.
-- If a watched file does not exist yet but its parent directory does, Rally watches the parent directory non-recursively so future writes can still trigger a restart.
-- Directory watches honor `recursive = true`; file watches are always non-recursive.
-
-The dashboard `Info` tab now shows whether watching is enabled, the normalized watch paths Rally registered, and the last restart reason observed for that app.
 
 See [`rally.toml.example`](rally.toml.example) for a full example.
 
