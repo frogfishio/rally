@@ -1,0 +1,44 @@
+# start.toml — example configuration for the `start` dev helper
+#
+# Run with: start [path/to/start.toml]
+# Then open http://127.0.0.1:7700 in your browser.
+
+# ── UI settings (optional) ────────────────────────────────────────────────
+[ui]
+host = "127.0.0.1"
+port = 7700
+
+# ── Application definitions ───────────────────────────────────────────────
+
+[[app]]
+name    = "api-server"
+command = "sleep"          # replace with your real binary, e.g. "./target/debug/api-server"
+args    = ["3600"]
+workdir = "."              # optional; defaults to directory of this file
+restart_on_exit = false
+health_url      = "http://localhost:8080/health"   # remove if not applicable
+health_interval_secs = 10
+log_lines = 500
+
+[app.env]
+DATABASE_URL = "postgres://localhost/mydb"
+LOG_LEVEL    = "debug"
+PORT         = "8080"
+
+[[app]]
+name    = "worker"
+command = "sleep"
+args    = ["3600"]
+restart_on_exit = true
+
+[app.env]
+QUEUE_URL = "amqp://localhost"
+WORKERS   = "4"
+
+[[app]]
+name    = "frontend"
+command = "sleep"
+args    = ["3600"]
+
+[app.env]
+NODE_ENV = "development"
