@@ -466,30 +466,35 @@ health_interval_secs = 30
 
     #[test]
     fn interpolates_app_and_hook_fields() {
-        let home = std::env::var("HOME").unwrap();
-        let toml = r#"
+        let (home_var, home) = std::env::var("HOME")
+            .map(|value| ("HOME", value))
+            .or_else(|_| std::env::var("USERPROFILE").map(|value| ("USERPROFILE", value)))
+            .unwrap();
+        let toml = format!(
+            r#"
 [[app]]
 name = "svc"
-command = "${HOME}/bin/svc"
-args = ["--data=${DATA_DIR}"]
-workdir = "${HOME}/workspace"
-health_url = "http://${HOST}:8080/health"
+command = "${{{home_var}}}/bin/svc"
+    args = ["--data=${{DATA_DIR}}"]
+workdir = "${{{home_var}}}/workspace"
+    health_url = "http://${{HOST}}:8080/health"
 
 [app.env]
 HOST = "127.0.0.1"
-DATA_DIR = "${HOME}/data"
+DATA_DIR = "${{{home_var}}}/data"
 
 [[app.before]]
 command = "echo"
-args = ["${DATA_DIR}", "${HOOK_DIR}"]
+    args = ["${{DATA_DIR}}", "${{HOOK_DIR}}"]
 
 [app.before.env]
-HOOK_DIR = "${DATA_DIR}/hooks"
+    HOOK_DIR = "${{DATA_DIR}}/hooks"
 
 [app.watch]
-paths = ["${DATA_DIR}/config.toml"]
-"#;
-        let cfg = parse(toml).unwrap();
+    paths = ["${{DATA_DIR}}/config.toml"]
+"#
+    );
+        let cfg = parse(&toml).unwrap();
         let app = &cfg.app[0];
         assert_eq!(app.command, format!("{}/bin/svc", home));
         assert_eq!(app.args, vec![format!("--data={}/data", home)]);

@@ -59,6 +59,9 @@ make clean
 
 # Delete Cargo build artifacts and packaged dist output
 make distclean
+
+# Sync Cargo.toml to VERSION, increment BUILD, test, commit, tag, and push a release
+make release
 ```
 
 ## GitHub Actions
@@ -84,9 +87,18 @@ Each published release bundle includes:
 Recommended release flow:
 
 1. Run `make bump` if you are incrementing the version.
-2. Commit the updated `VERSION` and `Cargo.toml`.
-3. Push the branch and let `CI` pass.
-4. Create and push tag `v$(cat VERSION)`, or run the `Release` workflow manually.
+2. Run `make release`.
+
+`make release` requires a clean working tree. It will:
+
+- sync `Cargo.toml` package version to `VERSION`
+- increment `BUILD`
+- run `cargo test`
+- create a release commit
+- create annotated tag `v<VERSION>`
+- push the current branch and tag to `origin`
+
+That push triggers the `Release` GitHub Actions workflow, which builds and publishes the cross-platform release artifacts.
 
 ---
 
