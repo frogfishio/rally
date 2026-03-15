@@ -1,8 +1,8 @@
 [package]
-name = "start"
+name = "rally"
 version = "0.1.0"
 edition = "2024"
-description = "A development helper that manages multiple processes with an embedded web UI"
+description = "Rally your services with an embedded development dashboard"
 license = "MIT"
 
 [dependencies]
@@ -18,3 +18,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+ratatouille = "0.1.0"

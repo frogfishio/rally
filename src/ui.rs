@@ -5,7 +5,7 @@ pub fn dashboard_html() -> &'static str {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>start — process dashboard</title>
+<title>Rally — Rally your services</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -59,6 +59,17 @@ pub fn dashboard_html() -> &'static str {
   }
   header .conn-badge.connected { background: #052; color: var(--green); }
   header .conn-badge.error { background: #400; color: var(--red); }
+  header .header-btn {
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  header .header-btn:hover { background: var(--border); }
 
   main { padding: 24px; display: flex; flex-direction: column; gap: 20px; }
 
@@ -250,8 +261,9 @@ pub fn dashboard_html() -> &'static str {
 </head>
 <body>
 <header>
-  <h1>▶ start</h1>
-  <span class="subtitle">process dashboard</span>
+  <h1>▶ Rally</h1>
+  <span class="subtitle">Rally your services</span>
+  <button class="header-btn" onclick="reloadConfig()">reload config</button>
   <span class="conn-badge" id="conn-badge">connecting…</span>
 </header>
 <main>
@@ -283,6 +295,11 @@ async function actionKill(name) {
 
 async function actionRestart(name) {
   await fetch('/api/restart/' + encodeURIComponent(name), { method: 'POST' });
+}
+
+async function actionReload() {
+  const res = await fetch('/api/reload', { method: 'POST' });
+  if (!res.ok) throw new Error('Reload failed ' + res.status);
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
@@ -464,6 +481,11 @@ async function killProc(name) {
 
 async function restartProc(name) {
   await actionRestart(name);
+  refresh();
+}
+
+async function reloadConfig() {
+  await actionReload();
   refresh();
 }
 

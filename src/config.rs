@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Root configuration loaded from `start.toml`.
+/// Root configuration loaded from `rally.toml`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
@@ -19,7 +19,7 @@ pub struct AppConfig {
     pub name: String,
     /// Path (or binary name if on $PATH) of the executable.
     pub command: String,
-    /// Optional working directory; defaults to the directory containing `start.toml`.
+    /// Optional working directory; defaults to the directory containing `rally.toml`.
     pub workdir: Option<String>,
     /// Command-line arguments passed to the process.
     #[serde(default)]
@@ -27,6 +27,15 @@ pub struct AppConfig {
     /// Environment variables injected into the process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Other apps that must be started before this app.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Commands to run before the process starts; any failure blocks startup.
+    #[serde(default)]
+    pub before: Vec<HookConfig>,
+    /// Commands to run after the process exits or is stopped.
+    #[serde(default)]
+    pub after: Vec<HookConfig>,
     /// Optional HTTP health-check URL polled periodically.
     pub health_url: Option<String>,
     /// Health-check interval in seconds (default: 10).
@@ -38,6 +47,21 @@ pub struct AppConfig {
     /// Number of lines of stdout/stderr to keep in memory per process (default: 500).
     #[serde(default = "default_log_lines")]
     pub log_lines: usize,
+}
+
+/// A one-shot command hook that runs before or after an app lifecycle event.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HookConfig {
+    /// Path (or binary name if on $PATH) of the executable.
+    pub command: String,
+    /// Command-line arguments passed to the hook.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional working directory; defaults to the app working directory.
+    pub workdir: Option<String>,
+    /// Environment variables injected into the hook.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Embedded web-UI configuration.
@@ -76,18 +100,188 @@ fn default_log_lines() -> usize {
     500
 }
 
-/// Load and parse `start.toml` from the given path.
+/// Load and parse `rally.toml` from the given path.
 pub fn load(path: &Path) -> Result<Config> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     let config: Config = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-    Ok(config)
+    interpolate_config(config)
 }
 
 /// Parse a config from a TOML string (used in tests).
+#[cfg(test)]
 pub fn parse(toml: &str) -> Result<Config> {
-    toml::from_str(toml).map_err(Into::into)
+    let config = toml::from_str(toml)?;
+    interpolate_config(config)
+}
+
+fn interpolate_config(mut config: Config) -> Result<Config> {
+    let process_env: HashMap<String, String> = std::env::vars().collect();
+
+    for app in &mut config.app {
+        let resolved_env = resolve_env_map(&app.env, &process_env)
+            .with_context(|| format!("Failed to resolve env for app {}", app.name))?;
+        app.env = resolved_env.clone();
+
+        let mut app_scope = process_env.clone();
+        app_scope.extend(resolved_env.clone());
+
+        app.name = interpolate_string(&app.name, &app_scope)
+            .with_context(|| "Failed to resolve app name")?;
+        app.command = interpolate_string(&app.command, &app_scope)
+            .with_context(|| format!("Failed to resolve command for app {}", app.name))?;
+        app.args = app
+            .args
+            .iter()
+            .map(|arg| {
+                interpolate_string(arg, &app_scope)
+                    .with_context(|| format!("Failed to resolve argument for app {}", app.name))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        app.workdir = app
+            .workdir
+            .as_ref()
+            .map(|value| {
+                interpolate_string(value, &app_scope)
+                    .with_context(|| format!("Failed to resolve workdir for app {}", app.name))
+            })
+            .transpose()?;
+        app.health_url = app
+            .health_url
+            .as_ref()
+            .map(|value| {
+                interpolate_string(value, &app_scope)
+                    .with_context(|| format!("Failed to resolve health_url for app {}", app.name))
+            })
+            .transpose()?;
+
+        for hook in &mut app.before {
+            interpolate_hook(hook, &app_scope, &app.name, "before")?;
+        }
+
+        for hook in &mut app.after {
+            interpolate_hook(hook, &app_scope, &app.name, "after")?;
+        }
+    }
+
+    Ok(config)
+}
+
+fn interpolate_hook(
+    hook: &mut HookConfig,
+    app_scope: &HashMap<String, String>,
+    app_name: &str,
+    phase: &str,
+) -> Result<()> {
+    let resolved_env = resolve_env_map(&hook.env, app_scope).with_context(|| {
+        format!("Failed to resolve {} hook env for app {}", phase, app_name)
+    })?;
+    hook.env = resolved_env.clone();
+
+    let mut scope = app_scope.clone();
+    scope.extend(resolved_env);
+
+    hook.command = interpolate_string(&hook.command, &scope)
+        .with_context(|| format!("Failed to resolve {} hook command for app {}", phase, app_name))?;
+    hook.args = hook
+        .args
+        .iter()
+        .map(|arg| {
+            interpolate_string(arg, &scope).with_context(|| {
+                format!("Failed to resolve {} hook arg for app {}", phase, app_name)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    hook.workdir = hook
+        .workdir
+        .as_ref()
+        .map(|value| {
+            interpolate_string(value, &scope).with_context(|| {
+                format!("Failed to resolve {} hook workdir for app {}", phase, app_name)
+            })
+        })
+        .transpose()?;
+
+    Ok(())
+}
+
+fn resolve_env_map(
+    values: &HashMap<String, String>,
+    base_scope: &HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut resolved = HashMap::with_capacity(values.len());
+    let mut visiting = Vec::new();
+
+    for key in values.keys() {
+        resolve_env_key(key, values, base_scope, &mut resolved, &mut visiting)?;
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_env_key(
+    key: &str,
+    values: &HashMap<String, String>,
+    base_scope: &HashMap<String, String>,
+    resolved: &mut HashMap<String, String>,
+    visiting: &mut Vec<String>,
+) -> Result<String> {
+    if let Some(value) = resolved.get(key) {
+        return Ok(value.clone());
+    }
+
+    if visiting.iter().any(|entry| entry == key) {
+        visiting.push(key.to_owned());
+        anyhow::bail!("ENV interpolation cycle detected: {}", visiting.join(" -> "));
+    }
+
+    let template = values
+        .get(key)
+        .with_context(|| format!("Missing env key {} during interpolation", key))?;
+    visiting.push(key.to_owned());
+    let value = interpolate_with_lookup(template, &mut |name| {
+        if values.contains_key(name) {
+            return resolve_env_key(name, values, base_scope, resolved, visiting).map(Some);
+        }
+        Ok(base_scope.get(name).cloned())
+    })?;
+    visiting.pop();
+    resolved.insert(key.to_owned(), value.clone());
+    Ok(value)
+}
+
+fn interpolate_string(template: &str, scope: &HashMap<String, String>) -> Result<String> {
+    interpolate_with_lookup(template, &mut |name| Ok(scope.get(name).cloned()))
+}
+
+fn interpolate_with_lookup<F>(template: &str, lookup: &mut F) -> Result<String>
+where
+    F: FnMut(&str) -> Result<Option<String>>,
+{
+    let mut output = String::with_capacity(template.len());
+    let mut cursor = 0;
+
+    while let Some(start) = template[cursor..].find("${") {
+        let start_index = cursor + start;
+        output.push_str(&template[cursor..start_index]);
+        let name_start = start_index + 2;
+        let Some(end_rel) = template[name_start..].find('}') else {
+            anyhow::bail!("Unclosed ENV interpolation in {}", template);
+        };
+        let end_index = name_start + end_rel;
+        let name = &template[name_start..end_index];
+        if name.is_empty() {
+            anyhow::bail!("Empty ENV interpolation in {}", template);
+        }
+        let value = lookup(name)?
+            .ok_or_else(|| anyhow::anyhow!("Unknown ENV variable {} in {}", name, template))?;
+        output.push_str(&value);
+        cursor = end_index + 1;
+    }
+
+    output.push_str(&template[cursor..]);
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -116,6 +310,9 @@ command = "/usr/bin/myapp"
         assert_eq!(app.command, "/usr/bin/myapp");
         assert!(app.args.is_empty());
         assert!(app.env.is_empty());
+        assert!(app.depends_on.is_empty());
+        assert!(app.before.is_empty());
+        assert!(app.after.is_empty());
         assert!(!app.restart_on_exit);
         assert_eq!(app.health_interval_secs, 10);
         assert_eq!(app.log_lines, 500);
@@ -142,6 +339,38 @@ LOG  = "debug"
         assert_eq!(app.log_lines, 200);
         assert_eq!(app.env["PORT"], "8080");
         assert_eq!(app.env["LOG"], "debug");
+    }
+
+    #[test]
+    fn app_with_before_and_after_hooks() {
+        let toml = r#"
+[[app]]
+name    = "server"
+command = "./server"
+depends_on = ["database"]
+
+[[app.before]]
+command = "./prep"
+args = ["--ensure-db"]
+
+[app.before.env]
+MODE = "prepare"
+
+[[app.after]]
+command = "./cleanup"
+args = ["--remove-lock"]
+workdir = "./tmp"
+"#;
+        let cfg = parse(toml).unwrap();
+        let app = &cfg.app[0];
+        assert_eq!(app.depends_on, vec!["database"]);
+        assert_eq!(app.before.len(), 1);
+        assert_eq!(app.after.len(), 1);
+        assert_eq!(app.before[0].command, "./prep");
+        assert_eq!(app.before[0].args, vec!["--ensure-db"]);
+        assert_eq!(app.before[0].env["MODE"], "prepare");
+        assert_eq!(app.after[0].command, "./cleanup");
+        assert_eq!(app.after[0].workdir.as_deref(), Some("./tmp"));
     }
 
     #[test]
@@ -186,5 +415,67 @@ health_interval_secs = 30
         let app = &cfg.app[0];
         assert_eq!(app.health_url.as_deref(), Some("http://localhost:8080/health"));
         assert_eq!(app.health_interval_secs, 30);
+    }
+
+    #[test]
+    fn interpolates_app_and_hook_fields() {
+        let home = std::env::var("HOME").unwrap();
+        let toml = r#"
+[[app]]
+name = "svc"
+command = "${HOME}/bin/svc"
+args = ["--data=${DATA_DIR}"]
+workdir = "${HOME}/workspace"
+health_url = "http://${HOST}:8080/health"
+
+[app.env]
+HOST = "127.0.0.1"
+DATA_DIR = "${HOME}/data"
+
+[[app.before]]
+command = "echo"
+args = ["${DATA_DIR}", "${HOOK_DIR}"]
+
+[app.before.env]
+HOOK_DIR = "${DATA_DIR}/hooks"
+"#;
+        let cfg = parse(toml).unwrap();
+        let app = &cfg.app[0];
+        assert_eq!(app.command, format!("{}/bin/svc", home));
+        assert_eq!(app.args, vec![format!("--data={}/data", home)]);
+        let expected_workdir = format!("{}/workspace", home);
+        assert_eq!(app.workdir.as_deref(), Some(expected_workdir.as_str()));
+        assert_eq!(app.health_url.as_deref(), Some("http://127.0.0.1:8080/health"));
+        assert_eq!(app.env["DATA_DIR"], format!("{}/data", home));
+        assert_eq!(app.before[0].args[0], format!("{}/data", home));
+        assert_eq!(app.before[0].args[1], format!("{}/data/hooks", home));
+    }
+
+    #[test]
+    fn rejects_unknown_env_variable() {
+        let toml = r#"
+[[app]]
+name    = "svc"
+command = "${MISSING}/svc"
+"#;
+        let error = parse(toml).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Unknown ENV variable MISSING"));
+    }
+
+    #[test]
+    fn rejects_env_cycles() {
+        let toml = r#"
+[[app]]
+name    = "svc"
+command = "svc"
+
+[app.env]
+A = "${B}"
+B = "${A}"
+"#;
+        let error = parse(toml).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("ENV interpolation cycle detected"));
     }
 }
