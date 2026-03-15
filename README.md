@@ -61,6 +61,33 @@ make clean
 make distclean
 ```
 
+## GitHub Actions
+
+The repository is set up for two GitHub Actions workflows:
+
+- `CI` runs on pushes to `main` and `master`, plus pull requests, and verifies `cargo test` and `cargo build --release` on Linux, macOS, and Windows.
+- `Release` builds packaged release bundles for Linux, macOS, and Windows and publishes them to a GitHub Release.
+
+The release workflow is intentionally not tied to every push. You can use it in two ways:
+
+1. Push a tag that matches the current `VERSION`, such as `v5.0.0`.
+2. Run the `Release` workflow manually from GitHub Actions. If you do not provide a tag, it defaults to `v<VERSION>` and validates that the tag matches the repo's `VERSION` file.
+
+Each published release bundle includes:
+
+- The platform binary in `bin/`
+- `USER_GUIDE.md`
+- `README.md`
+- `LICENSE`
+- `rally.toml.example`
+
+Recommended release flow:
+
+1. Run `make bump` if you are incrementing the version.
+2. Commit the updated `VERSION` and `Cargo.toml`.
+3. Push the branch and let `CI` pass.
+4. Create and push tag `v$(cat VERSION)`, or run the `Release` workflow manually.
+
 ---
 
 ## Usage
