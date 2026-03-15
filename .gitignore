@@ -1,3 +1,4 @@
 /target
+/dist
 # Local instance config — use rally.toml.example as a template
 rally.toml

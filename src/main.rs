@@ -8,7 +8,7 @@ mod ui;
 mod web;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use process_manager::ProcessManager;
 use sink::TelemetrySink;
 use std::net::SocketAddr;
@@ -16,10 +16,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+const DISPLAY_VERSION: &str = env!("RALLY_DISPLAY_VERSION");
+const LICENSE_SUMMARY: &str = "Copyright (C) 2026 Alexander R. Croft\nLicense: GPL-3.0-or-later\n";
+
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(
     name = "rally",
-    version,
+    version = DISPLAY_VERSION,
     about = "Rally your services with a local process dashboard",
     long_about = "Rally launches and supervises multiple local development processes, serves an embedded dashboard, and can optionally forward lifecycle and process output events to a ratatouille sink.",
     after_help = "Examples:\n  rally\n  rally --config ./rally.toml\n  rally --sink http://127.0.0.1:9100/ingest\n  rally ./custom-rally.toml"
@@ -43,6 +46,9 @@ struct CliArgs {
 
     #[arg(long = "sink", value_name = "URL", help = "Optional ratatouille HTTP sink URL")]
     sink_url: Option<String>,
+
+    #[arg(long = "license", help = "Print copyright and license summary")]
+    license: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,24 +57,48 @@ struct CliOptions {
     sink_url: Option<String>,
 }
 
-fn parse_cli_args() -> Result<CliOptions> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliAction {
+    Run(CliOptions),
+    Print(String),
+}
+
+fn parse_cli_args() -> Result<CliAction> {
     parse_cli_args_from(std::env::args_os())
 }
 
-fn parse_cli_args_from<I, T>(args: I) -> Result<CliOptions>
+fn parse_cli_args_from<I, T>(args: I) -> Result<CliAction>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let args = CliArgs::try_parse_from(args).map_err(|error| anyhow!(error.to_string()))?;
+    let args = match CliArgs::try_parse_from(args) {
+        Ok(args) => args,
+        Err(error) => {
+            return match error.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    Ok(CliAction::Print(error.to_string()))
+                }
+                _ => Err(anyhow!(error.to_string())),
+            };
+        }
+    };
 
-    Ok(CliOptions {
+    if args.license {
+        return Ok(CliAction::Print(format_license_text()));
+    }
+
+    Ok(CliAction::Run(CliOptions {
         config_path: args
             .config_path
             .or(args.config_path_positional)
             .unwrap_or_else(|| PathBuf::from("rally.toml")),
         sink_url: args.sink_url,
-    })
+    }))
+}
+
+fn format_license_text() -> String {
+    LICENSE_SUMMARY.to_owned()
 }
 
 #[tokio::main]
@@ -85,7 +115,13 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let cli = parse_cli_args()?;
+    let cli = match parse_cli_args()? {
+        CliAction::Run(cli) => cli,
+        CliAction::Print(output) => {
+            print!("{output}");
+            return Ok(());
+        }
+    };
     let config_path = cli.config_path.clone();
 
     let cfg = config::load(&config_path)
@@ -164,11 +200,21 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliArgs, parse_cli_args_from};
+    use super::{CliAction, CliArgs, DISPLAY_VERSION, format_license_text, parse_cli_args_from};
+    use anyhow::anyhow;
     use clap::CommandFactory;
     use std::path::PathBuf;
 
     fn parse_from(args: &[&str]) -> anyhow::Result<super::CliOptions> {
+        let mut argv = vec!["rally"];
+        argv.extend_from_slice(args);
+        match parse_cli_args_from(argv)? {
+            CliAction::Run(cli) => Ok(cli),
+            CliAction::Print(output) => Err(anyhow!("unexpected print action: {output}")),
+        }
+    }
+
+    fn parse_action(args: &[&str]) -> anyhow::Result<CliAction> {
         let mut argv = vec!["rally"];
         argv.extend_from_slice(args);
         parse_cli_args_from(argv)
@@ -213,8 +259,29 @@ mod tests {
         let mut command = CliArgs::command();
         let help = command.render_long_help().to_string();
         assert!(help.contains("--config"));
+        assert!(help.contains("--license"));
         assert!(help.contains("--sink"));
         assert!(help.contains("Examples:"));
+    }
+
+    #[test]
+    fn version_flag_prints_display_version() {
+        let action = parse_action(&["--version"]).unwrap();
+        let CliAction::Print(output) = action else {
+            panic!("expected print action");
+        };
+
+        assert!(output.contains(DISPLAY_VERSION));
+    }
+
+    #[test]
+    fn license_flag_prints_license_summary() {
+        let action = parse_action(&["--license"]).unwrap();
+        let CliAction::Print(output) = action else {
+            panic!("expected print action");
+        };
+
+        assert_eq!(output, format_license_text());
     }
 }
 

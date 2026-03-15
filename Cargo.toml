@@ -3,7 +3,7 @@
 
 [package]
 name = "rally"
-version = "0.1.0"
+version = "5.0.0"
 edition = "2024"
 description = "Rally your services with an embedded development dashboard"
 license = "GPL-3.0-or-later"

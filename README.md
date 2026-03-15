@@ -39,6 +39,22 @@ cargo build --release
 ./target/release/rally
 ```
 
+For local release helpers:
+
+```sh
+# Increment the patch component in VERSION and sync Cargo.toml package version
+make bump
+
+# Increment BUILD, run a release build, and copy the binary to dist/<os>-<arch>/bin
+make dist
+
+# Delete Cargo build artifacts under target/
+make clean
+
+# Delete Cargo build artifacts and packaged dist output
+make distclean
+```
+
 ---
 
 ## Usage
@@ -58,6 +74,12 @@ rally --sink http://127.0.0.1:9100/ingest
 
 # Show CLI help
 rally --help
+
+# Show version with build metadata from VERSION and BUILD
+rally --version
+
+# Show copyright and license summary
+rally --license
 ```
 
 Then open **http://127.0.0.1:7700** in your browser.
