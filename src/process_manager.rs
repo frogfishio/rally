@@ -85,6 +85,7 @@ pub struct LogLine {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessStatus {
     pub name: String,
+    pub access: Option<String>,
     pub command: String,
     pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
@@ -176,6 +177,7 @@ impl ManagedProcess {
             .collect::<Vec<_>>();
         ProcessStatus {
             name: self.config.name.clone(),
+            access: self.config.access.clone(),
             command: self.config.command.clone(),
             args: self.config.args.clone(),
             env: self.config.env.clone(),
@@ -986,6 +988,7 @@ mod tests {
     fn app(name: &str, depends_on: &[&str]) -> AppConfig {
         AppConfig {
             name: name.to_owned(),
+            access: None,
             command: name.to_owned(),
             workdir: None,
             args: Vec::new(),

@@ -20,6 +20,8 @@ pub struct Config {
 pub struct AppConfig {
     /// Unique display name for the application.
     pub name: String,
+    /// Optional dashboard-friendly access string shown instead of the launch command.
+    pub access: Option<String>,
     /// Path (or binary name if on $PATH) of the executable.
     pub command: String,
     /// Optional working directory; defaults to the directory containing `rally.toml`.
@@ -156,6 +158,14 @@ fn interpolate_config(mut config: Config) -> Result<Config> {
 
         app.name = interpolate_string(&app.name, &app_scope)
             .with_context(|| "Failed to resolve app name")?;
+        app.access = app
+            .access
+            .as_ref()
+            .map(|value| {
+                interpolate_string(value, &app_scope)
+                    .with_context(|| format!("Failed to resolve access for app {}", app.name))
+            })
+            .transpose()?;
         app.command = interpolate_string(&app.command, &app_scope)
             .with_context(|| format!("Failed to resolve command for app {}", app.name))?;
         app.args = app
@@ -345,6 +355,7 @@ command = "/usr/bin/myapp"
         assert_eq!(cfg.app.len(), 1);
         let app = &cfg.app[0];
         assert_eq!(app.name, "myapp");
+        assert_eq!(app.access, None);
         assert_eq!(app.command, "/usr/bin/myapp");
         assert!(app.args.is_empty());
         assert!(app.env.is_empty());
@@ -362,6 +373,7 @@ command = "/usr/bin/myapp"
         let toml = r#"
 [[app]]
 name    = "server"
+access  = "http://localhost:8080"
 command = "./server"
 args    = ["--port", "8080"]
 restart_on_exit = true
@@ -373,6 +385,7 @@ LOG  = "debug"
 "#;
         let cfg = parse(toml).unwrap();
         let app = &cfg.app[0];
+        assert_eq!(app.access.as_deref(), Some("http://localhost:8080"));
         assert_eq!(app.args, vec!["--port", "8080"]);
         assert!(app.restart_on_exit);
         assert_eq!(app.log_lines, 200);
@@ -474,6 +487,7 @@ health_interval_secs = 30
             r#"
 [[app]]
 name = "svc"
+access = "http://${{HOST}}:8080"
 command = "${{{home_var}}}/bin/svc"
     args = ["--data=${{DATA_DIR}}"]
 workdir = "${{{home_var}}}/workspace"
@@ -496,6 +510,7 @@ command = "echo"
     );
         let cfg = parse(&toml).unwrap();
         let app = &cfg.app[0];
+        assert_eq!(app.access.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(app.command, format!("{}/bin/svc", home));
         assert_eq!(app.args, vec![format!("--data={}/data", home)]);
         let expected_workdir = format!("{}/workspace", home);

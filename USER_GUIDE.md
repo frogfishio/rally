@@ -16,6 +16,7 @@ Rally reads a `rally.toml` file and starts the apps listed there.
 Once Rally is running, it gives you:
 
 - A browser dashboard showing all managed apps.
+- An optional access label for each app, so embedded UIs and local endpoints are easier to recognize.
 - Live status for each app.
 - Health indicators when an app has a health check configured.
 - Per-app logs.
@@ -57,6 +58,7 @@ Each app appears as its own card.
 On each card you can usually see:
 
 - The app name.
+- Its access point when one is configured, such as a local UI URL, port, or operator hint.
 - Whether it is running, stopped, exited, or unhealthy.
 - Its process ID while running.
 - Restart count.
@@ -64,6 +66,8 @@ On each card you can usually see:
 - Quick actions such as restart or kill.
 
 Selecting an app opens more detail, including logs, environment values, and operational information.
+
+If an app has its own embedded UI, admin page, or local endpoint, that access point can be shown directly on the card instead of the raw startup command. If the value is an `http://` or `https://` URL, you can open it directly from the dashboard in a new tab.
 
 ---
 
@@ -106,7 +110,17 @@ Use this first when an app:
 
 Open the Info view for the app.
 
-Rally shows the last restart reason there, along with watch status and the watch paths it registered.
+Rally shows the last restart reason there, along with the configured access value, watch status, and the watch paths it registered.
+
+### Open an App's Own UI
+
+Some apps managed by Rally also serve their own local UI.
+
+When the app config includes an `access` value such as `http://127.0.0.1:3000`, Rally shows that in the app card instead of the raw command line.
+
+If the value starts with `http://` or `https://`, select it from the dashboard to open that app's UI in a new browser tab.
+
+If the value is not a web URL, Rally still shows it as a plain label so you can remember details such as a port, local socket, or setup note.
 
 ---
 
@@ -135,6 +149,8 @@ If an app shows unhealthy:
 4. Restart the app if needed.
 
 If the app is actually working but still shows unhealthy, the configured health URL may be wrong or too strict for that app.
+
+Health checks and `access` serve different purposes. A health check tells Rally whether the app responds correctly. `access` tells you where or how to reach the app as an operator.
 
 ---
 
@@ -182,6 +198,35 @@ If the dashboard opens but no apps are running:
 2. Make sure you started Rally in the directory you expected, or used `--config`.
 3. Reload the config after any changes.
 4. Check the terminal where Rally itself was started for startup messages.
+
+---
+
+## Configuring Access Labels
+
+In `rally.toml`, each `[[app]]` entry can optionally define an `access` field.
+
+Examples:
+
+```toml
+[[app]]
+name = "frontend"
+access = "http://127.0.0.1:3000"
+command = "npm"
+args = ["run", "dev"]
+
+[[app]]
+name = "database"
+access = "postgres://localhost:5432/mydb"
+command = "docker"
+args = ["compose", "up", "postgres"]
+
+[[app]]
+name = "admin-worker"
+access = "admin on port 9090"
+command = "./worker"
+```
+
+Use `access` when the thing you need to remember is how to reach the app, not how Rally launched it.
 
 ---
 

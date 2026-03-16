@@ -11,7 +11,8 @@ For a day-to-day operator view, see [USER_GUIDE.md](USER_GUIDE.md).
 
 ## Features
 
-- **`rally.toml` config** — define any number of apps with command, arguments, environment variables, working directory, and optional HTTP health checks.
+- **`rally.toml` config** — define any number of apps with command, arguments, optional dashboard access labels, environment variables, working directory, and optional HTTP health checks.
+- **Access labels** — optionally show a friendly access URL, port, or operator hint in the dashboard instead of the raw launch command.
 - **Lifecycle hooks** — run `before` prep commands and `after` cleanup commands around each app.
 - **Dependency ordering** — declare `depends_on` so services come up and go down in a predictable sequence.
 - **ENV interpolation** — use `${VAR}` in commands, args, workdirs, URLs, and env values.
@@ -22,7 +23,7 @@ For a day-to-day operator view, see [USER_GUIDE.md](USER_GUIDE.md).
 - **CLI surface** — built-in `--help`, `--version`, `--license`, explicit `--config`, optional `--sink`, and legacy positional config compatibility.
 - **Embedded web UI** at `http://127.0.0.1:7700` (configurable) — no external tools needed.
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
-- **Operational visibility** — the dashboard `Info` tab shows watch status, normalized watch paths, and the last restart reason for each app.
+- **Operational visibility** — the dashboard `Info` tab shows access details, watch status, normalized watch paths, and the last restart reason for each app.
 - **Log viewer** — per-process stdout/stderr capture with filter and auto-scroll.
 - **Kill / Restart** — one-click stop or restart of individual processes from the UI.
 - **Auto-restart** — optional `restart_on_exit = true` to keep processes alive.
@@ -194,6 +195,7 @@ port = 7700
 # Define as many [[app]] entries as you like
 [[app]]
 name    = "api-server"
+access  = "http://127.0.0.1:8080"   # optional dashboard label; URLs become clickable links
 command = "./target/debug/api-server"
 args    = ["--port", "8080"]
 depends_on = ["database"]
@@ -223,11 +225,13 @@ DATA_DIR     = "${HOME}/dev/api-data"
 
 [[app]]
 name    = "database"
+access  = "postgres://localhost:5432/mydb"
 command = "docker"
 args    = ["compose", "up", "postgres"]
 
 [[app]]
 name    = "worker"
+access  = "queue: amqp://localhost"
 command = "./target/debug/worker"
 args    = ["--concurrency", "4"]
 depends_on = ["api-server"]
@@ -244,6 +248,10 @@ API_URL   = "http://${HOST}:8080"
 `ENV` interpolation uses `${VAR}` syntax. Rally resolves values from the current process environment first, then app and hook `env` entries with deterministic cycle detection and unknown-variable errors.
 
 See [`rally.toml.example`](rally.toml.example) for a full example.
+
+If `access` is set, the dashboard shows that value in the app card instead of the launch command line. This is useful for apps that expose their own embedded UI, local admin page, port, or setup hint and are easier to operate by access point than by startup command.
+
+Values beginning with `http://` or `https://` render as links that open in a new tab. Other values such as `localhost:5432`, `queue: amqp://localhost`, or `admin on port 9090` are shown as plain text.
 
 ---
 

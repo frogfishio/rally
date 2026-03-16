@@ -140,6 +140,15 @@ pub fn dashboard_html() -> &'static str {
 
   .process-name { font-weight: 700; font-size: 14px; flex: 1; }
   .process-cmd  { color: var(--text-dim); font-size: 11px; flex: 2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .process-cmd a,
+  .info-table a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .process-cmd a:hover,
+  .info-table a:hover {
+    text-decoration: underline;
+  }
 
   .badge {
     padding: 2px 9px;
@@ -361,6 +370,19 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function isHttpUrl(value) {
+  return typeof value === 'string' && /^(https?:\/\/)/i.test(value);
+}
+
+function renderAccessValue(access) {
+  if (!access) return '—';
+  if (isHttpUrl(access)) {
+    const safeUrl = escAttr(access);
+    return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${escHtml(access)}</a>`;
+  }
+  return escHtml(access);
+}
+
 function renderEnv(env) {
   const entries = Object.entries(env || {});
   if (!entries.length) return '<p class="empty-msg">No environment variables configured.</p>';
@@ -387,6 +409,7 @@ function renderInfoTable(proc) {
     <tr><td>Watching</td><td>${proc.watch_enabled ? 'enabled' : 'disabled'}</td></tr>
     <tr><td>Watch debounce</td><td>${proc.watch_debounce_millis ? proc.watch_debounce_millis + 'ms' : '—'}</td></tr>
     <tr><td>Watch paths</td><td>${watchPaths}</td></tr>
+    <tr><td>Access</td><td>${renderAccessValue(proc.access)}</td></tr>
     <tr><td>Command</td><td>${escHtml(proc.command)}</td></tr>
     <tr><td>Args</td><td>${proc.args.length ? proc.args.map(escHtml).join(' ') : '—'}</td></tr>
   </table>`;
@@ -401,6 +424,8 @@ function renderCard(proc) {
   const sel   = proc.name === selectedName;
   const tab   = getTab(proc.name);
   const cmdFull = proc.command + (proc.args.length ? ' ' + proc.args.join(' ') : '');
+  const accessLabel = proc.access || cmdFull;
+  const accessTitle = proc.access ? proc.access : cmdFull;
   const isRunning = sc === 'running';
 
   return `
@@ -408,7 +433,7 @@ function renderCard(proc) {
     <div class="process-header" onclick="toggleCard('${escAttr(proc.name)}')">
       <div class="state-dot ${sc}"></div>
       <div class="process-name">${escHtml(proc.name)}</div>
-      <div class="process-cmd" title="${escAttr(cmdFull)}">${escHtml(cmdFull)}</div>
+      <div class="process-cmd" title="${escAttr(accessTitle)}">${renderAccessValue(accessLabel)}</div>
       <span class="badge ${sc}">${stateLabel(proc.state)}</span>
       ${proc.health !== 'not_configured' ? `<span class="badge ${hc}">${proc.health}</span>` : ''}
       <div class="process-meta">${isRunning && proc.started_at ? elapsedSince(proc.started_at) : ''}</div>
