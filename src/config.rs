@@ -22,6 +22,9 @@ pub struct AppConfig {
     pub name: String,
     /// Optional dashboard-friendly access string shown instead of the launch command.
     pub access: Option<String>,
+    /// Whether the app is enabled at startup and after config reload (default: true).
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// Path (or binary name if on $PATH) of the executable.
     pub command: String,
     /// Optional working directory; defaults to the directory containing `rally.toml`.
@@ -115,6 +118,10 @@ fn default_port() -> u16 {
 
 fn default_health_interval() -> u64 {
     10
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_log_lines() -> usize {
@@ -356,6 +363,7 @@ command = "/usr/bin/myapp"
         let app = &cfg.app[0];
         assert_eq!(app.name, "myapp");
         assert_eq!(app.access, None);
+        assert!(app.enabled);
         assert_eq!(app.command, "/usr/bin/myapp");
         assert!(app.args.is_empty());
         assert!(app.env.is_empty());
@@ -374,6 +382,7 @@ command = "/usr/bin/myapp"
 [[app]]
 name    = "server"
 access  = "http://localhost:8080"
+enabled = false
 command = "./server"
 args    = ["--port", "8080"]
 restart_on_exit = true
@@ -386,6 +395,7 @@ LOG  = "debug"
         let cfg = parse(toml).unwrap();
         let app = &cfg.app[0];
         assert_eq!(app.access.as_deref(), Some("http://localhost:8080"));
+        assert!(!app.enabled);
         assert_eq!(app.args, vec!["--port", "8080"]);
         assert!(app.restart_on_exit);
         assert_eq!(app.log_lines, 200);

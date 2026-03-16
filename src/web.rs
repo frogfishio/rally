@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::config;
-use crate::process_manager::SharedManager;
+use crate::process_manager::{ControlResult, SharedManager};
 use crate::sink::TelemetrySink;
 use crate::ui::dashboard_html;
 use axum::{
@@ -108,6 +108,10 @@ pub fn router(state: SharedAppState) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/api/status", get(status_handler))
+        .route("/api/start/{name}", post(start_handler))
+        .route("/api/stop/{name}", post(stop_handler))
+        .route("/api/enable/{name}", post(enable_handler))
+        .route("/api/disable/{name}", post(disable_handler))
         .route("/api/kill/{name}", post(kill_handler))
         .route("/api/restart/{name}", post(restart_handler))
         .route("/api/reload", post(reload_handler))
@@ -124,6 +128,54 @@ async fn status_handler(State(state): State<SharedAppState>) -> impl IntoRespons
     let mgr = state.current_manager().await;
     let statuses = mgr.all_statuses().await;
     Json(statuses)
+}
+
+fn control_status(result: ControlResult) -> StatusCode {
+    match result {
+        ControlResult::Ok => StatusCode::OK,
+        ControlResult::NotFound => StatusCode::NOT_FOUND,
+        ControlResult::Disabled => StatusCode::CONFLICT,
+    }
+}
+
+async fn start_handler(
+    Path(name): Path<String>,
+    State(state): State<SharedAppState>,
+) -> impl IntoResponse {
+    let mgr = state.current_manager().await;
+    control_status(mgr.start_by_name(&name, "manual start").await)
+}
+
+async fn stop_handler(
+    Path(name): Path<String>,
+    State(state): State<SharedAppState>,
+) -> impl IntoResponse {
+    let mgr = state.current_manager().await;
+    control_status(mgr.stop_by_name(&name, "manual stop").await)
+}
+
+async fn enable_handler(
+    Path(name): Path<String>,
+    State(state): State<SharedAppState>,
+) -> impl IntoResponse {
+    let mgr = state.current_manager().await;
+    if mgr.set_enabled_by_name(&name, true).await {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+async fn disable_handler(
+    Path(name): Path<String>,
+    State(state): State<SharedAppState>,
+) -> impl IntoResponse {
+    let mgr = state.current_manager().await;
+    if mgr.set_enabled_by_name(&name, false).await {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn kill_handler(
@@ -146,10 +198,7 @@ async fn restart_handler(
     State(state): State<SharedAppState>,
 ) -> impl IntoResponse {
     let mgr = state.current_manager().await;
-    if mgr.restart_by_name(&name, "manual restart").await {
-        return StatusCode::OK;
-    }
-    StatusCode::NOT_FOUND
+    control_status(mgr.restart_by_name(&name, "manual restart").await)
 }
 
 async fn reload_handler(State(state): State<SharedAppState>) -> impl IntoResponse {

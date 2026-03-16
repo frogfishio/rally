@@ -16,6 +16,13 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{error, info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlResult {
+    Ok,
+    NotFound,
+    Disabled,
+}
+
 #[derive(Debug)]
 enum HookError {
     Spawn(std::io::Error),
@@ -39,6 +46,8 @@ impl std::fmt::Display for HookError {
 pub enum ProcessState {
     /// Process has not been started yet.
     Pending,
+    /// Process is disabled and should not be started.
+    Disabled,
     /// Process is running.
     Running,
     /// Process exited with the given code.
@@ -53,6 +62,7 @@ impl std::fmt::Display for ProcessState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessState::Pending => write!(f, "pending"),
+            ProcessState::Disabled => write!(f, "disabled"),
             ProcessState::Running => write!(f, "running"),
             ProcessState::Exited(code) => write!(f, "exited({})", code),
             ProcessState::Killed => write!(f, "killed"),
@@ -86,6 +96,7 @@ pub struct LogLine {
 pub struct ProcessStatus {
     pub name: String,
     pub access: Option<String>,
+    pub enabled: bool,
     pub command: String,
     pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
@@ -104,6 +115,7 @@ pub struct ProcessStatus {
 
 /// Internal mutable state kept behind a lock.
 pub(crate) struct Inner {
+    enabled: bool,
     state: ProcessState,
     health: HealthStatus,
     pid: Option<u32>,
@@ -131,6 +143,22 @@ impl Inner {
     }
 }
 
+fn initial_health_status(config: &AppConfig) -> HealthStatus {
+    if config.health_url.is_some() {
+        HealthStatus::Unknown
+    } else {
+        HealthStatus::NotConfigured
+    }
+}
+
+fn initial_process_state(config: &AppConfig) -> ProcessState {
+    if config.enabled {
+        ProcessState::Pending
+    } else {
+        ProcessState::Disabled
+    }
+}
+
 /// A single managed process.
 pub struct ManagedProcess {
     pub config: AppConfig,
@@ -144,12 +172,9 @@ impl ManagedProcess {
     pub fn new(config: AppConfig, telemetry: Arc<TelemetrySink>) -> Self {
         let (change_tx, _) = broadcast::channel(32);
         let inner = Arc::new(RwLock::new(Inner {
-            state: ProcessState::Pending,
-            health: if config.health_url.is_some() {
-                HealthStatus::Unknown
-            } else {
-                HealthStatus::NotConfigured
-            },
+            enabled: config.enabled,
+            state: initial_process_state(&config),
+            health: initial_health_status(&config),
             pid: None,
             started_at: None,
             exit_time: None,
@@ -178,6 +203,7 @@ impl ManagedProcess {
         ProcessStatus {
             name: self.config.name.clone(),
             access: self.config.access.clone(),
+            enabled: inner.enabled,
             command: self.config.command.clone(),
             args: self.config.args.clone(),
             env: self.config.env.clone(),
@@ -218,6 +244,26 @@ impl ManagedProcess {
         inner.supervisor_active
     }
 
+    pub async fn set_enabled(&self, enabled: bool) -> bool {
+        let mut inner = self.inner.write().await;
+        let changed = inner.enabled != enabled;
+        inner.enabled = enabled;
+
+        if enabled {
+            if !inner.supervisor_active && inner.pid.is_none() {
+                inner.state = ProcessState::Pending;
+                inner.health = initial_health_status(&self.config);
+            }
+        } else {
+            inner.state = ProcessState::Disabled;
+            inner.health = initial_health_status(&self.config);
+            inner.started_at = None;
+        }
+
+        let _ = self.change_tx.send(());
+        changed
+    }
+
     /// Spawn (or re-spawn) the process and return immediately.
     /// A background task monitors the child process.
     pub async fn start(&self) {
@@ -226,6 +272,16 @@ impl ManagedProcess {
             if inner.supervisor_active {
                 return;
             }
+            if !inner.enabled {
+                inner.state = ProcessState::Disabled;
+                inner.pid = None;
+                inner.started_at = None;
+                inner.health = initial_health_status(&self.config);
+                let _ = self.change_tx.send(());
+                return;
+            }
+            inner.state = ProcessState::Pending;
+            inner.health = initial_health_status(&self.config);
             inner.supervisor_active = true;
         }
 
@@ -344,10 +400,19 @@ impl ManagedProcess {
                         inner.exit_time = Some(Utc::now());
                         inner.kill_tx = None;
 
+                        let enabled = inner.enabled;
+
                         match exit_status {
                             Ok(status) => {
                                 let code = status.code().unwrap_or(-1);
-                                inner.state = ProcessState::Exited(code);
+                                inner.state = if enabled {
+                                    ProcessState::Exited(code)
+                                } else {
+                                    ProcessState::Disabled
+                                };
+                                if !enabled {
+                                    inner.health = initial_health_status(&config);
+                                }
                                 info!(name = %config.name, code, "Process exited");
                                 telemetry.emit(
                                     "rally:process",
@@ -359,7 +424,14 @@ impl ManagedProcess {
                                 );
                             }
                             Err(e) => {
-                                inner.state = ProcessState::Killed;
+                                inner.state = if enabled {
+                                    ProcessState::Killed
+                                } else {
+                                    ProcessState::Disabled
+                                };
+                                if !enabled {
+                                    inner.health = initial_health_status(&config);
+                                }
                                 warn!(name = %config.name, error = %e, "Process wait error");
                                 telemetry.emit(
                                     "rally:process",
@@ -391,7 +463,8 @@ impl ManagedProcess {
                             let _ = change_tx.send(());
                         }
 
-                        if config.restart_on_exit
+                        if enabled
+                            && config.restart_on_exit
                             && !matches!(inner.state, ProcessState::Killed)
                         {
                             inner.restart_count += 1;
@@ -614,22 +687,82 @@ impl ProcessManager {
         }
     }
 
-    pub async fn restart_by_name(&self, name: &str, reason: &str) -> bool {
+    pub async fn start_by_name(&self, name: &str, reason: &str) -> ControlResult {
         let Some(index) = self.index_by_name.get(name).copied() else {
-            return false;
+            return ControlResult::NotFound;
         };
 
-        self.restart_by_index(index, reason).await;
-        true
+        self.start_by_index(index, reason).await
     }
 
-    pub async fn restart_by_index(&self, index: usize, reason: &str) {
+    pub async fn start_by_index(&self, index: usize, reason: &str) -> ControlResult {
+        let proc = self.processes[index].clone();
+
+        let p = proc.lock().await;
+        {
+            let mut inner = p.inner.write().await;
+            if !inner.enabled {
+                inner.last_restart_reason = Some(format!("{} (ignored: disabled)", reason));
+                let _ = p.change_tx.send(());
+                return ControlResult::Disabled;
+            }
+            inner.last_restart_reason = Some(reason.to_owned());
+            let _ = p.change_tx.send(());
+        }
+
+        p.telemetry.emit(
+            "rally:process",
+            format!("start requested for {} reason={}", p.config.name, reason),
+        );
+        p.start().await;
+        ControlResult::Ok
+    }
+
+    pub async fn stop_by_name(&self, name: &str, reason: &str) -> ControlResult {
+        let Some(index) = self.index_by_name.get(name).copied() else {
+            return ControlResult::NotFound;
+        };
+
+        self.stop_by_index(index, reason).await;
+        ControlResult::Ok
+    }
+
+    pub async fn stop_by_index(&self, index: usize, reason: &str) {
+        let proc = self.processes[index].clone();
+
+        let p = proc.lock().await;
+        {
+            let mut inner = p.inner.write().await;
+            inner.last_restart_reason = Some(reason.to_owned());
+            let _ = p.change_tx.send(());
+        }
+        p.telemetry.emit(
+            "rally:process",
+            format!("stop requested for {} reason={}", p.config.name, reason),
+        );
+        p.kill().await;
+    }
+
+    pub async fn restart_by_name(&self, name: &str, reason: &str) -> ControlResult {
+        let Some(index) = self.index_by_name.get(name).copied() else {
+            return ControlResult::NotFound;
+        };
+
+        self.restart_by_index(index, reason).await
+    }
+
+    pub async fn restart_by_index(&self, index: usize, reason: &str) -> ControlResult {
         let proc = self.processes[index].clone();
 
         {
             let p = proc.lock().await;
             {
                 let mut inner = p.inner.write().await;
+                if !inner.enabled {
+                    inner.last_restart_reason = Some(format!("{} (ignored: disabled)", reason));
+                    let _ = p.change_tx.send(());
+                    return ControlResult::Disabled;
+                }
                 inner.last_restart_reason = Some(reason.to_owned());
                 let _ = p.change_tx.send(());
             }
@@ -644,6 +777,57 @@ impl ProcessManager {
 
         let p = proc.lock().await;
         p.start().await;
+        ControlResult::Ok
+    }
+
+    pub async fn set_enabled_by_name(&self, name: &str, enabled: bool) -> bool {
+        let Some(index) = self.index_by_name.get(name).copied() else {
+            return false;
+        };
+
+        self.set_enabled_by_index(index, enabled).await;
+        true
+    }
+
+    pub async fn set_enabled_by_index(&self, index: usize, enabled: bool) {
+        let proc = self.processes[index].clone();
+        let mut should_wait_for_shutdown = false;
+
+        {
+            let p = proc.lock().await;
+            let changed = p.set_enabled(enabled).await;
+            if !changed {
+                return;
+            }
+
+            p.telemetry.emit(
+                "rally:process",
+                format!(
+                    "{} {}",
+                    if enabled { "enabled" } else { "disabled" },
+                    p.config.name
+                ),
+            );
+
+            {
+                let mut inner = p.inner.write().await;
+                inner.last_restart_reason = Some(if enabled {
+                    "enabled".to_owned()
+                } else {
+                    "disabled".to_owned()
+                });
+                let _ = p.change_tx.send(());
+            }
+
+            if !enabled {
+                should_wait_for_shutdown = p.is_supervisor_active().await;
+                p.kill().await;
+            }
+        }
+
+        if should_wait_for_shutdown {
+            self.wait_for_shutdown(&proc).await;
+        }
     }
 
     pub fn register_health_task(&self, task: JoinHandle<()>) {
@@ -989,6 +1173,7 @@ mod tests {
         AppConfig {
             name: name.to_owned(),
             access: None,
+            enabled: true,
             command: name.to_owned(),
             workdir: None,
             args: Vec::new(),
@@ -1067,6 +1252,59 @@ mod tests {
         assert!(targets.contains(&temp_root.join("target/debug")));
 
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn disabled_apps_stay_disabled_on_start_all() {
+        let mut disabled_app = app("api", &[]);
+        disabled_app.enabled = false;
+
+        let manager = super::ProcessManager::new(
+            vec![disabled_app],
+            Arc::new(TelemetrySink::new(None)),
+        )
+        .unwrap();
+
+        manager.start_all().await;
+        let statuses = manager.all_statuses().await;
+
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].enabled);
+        assert_eq!(statuses[0].state, super::ProcessState::Disabled);
+    }
+
+    #[tokio::test]
+    async fn can_toggle_enabled_state_at_runtime() {
+        let manager = super::ProcessManager::new(
+            vec![app("api", &[])],
+            Arc::new(TelemetrySink::new(None)),
+        )
+        .unwrap();
+
+        assert!(manager.set_enabled_by_name("api", false).await);
+        let statuses = manager.all_statuses().await;
+        assert!(!statuses[0].enabled);
+        assert_eq!(statuses[0].state, super::ProcessState::Disabled);
+
+        assert!(manager.set_enabled_by_name("api", true).await);
+        let statuses = manager.all_statuses().await;
+        assert!(statuses[0].enabled);
+        assert_eq!(statuses[0].state, super::ProcessState::Pending);
+    }
+
+    #[tokio::test]
+    async fn restart_reports_disabled_for_disabled_apps() {
+        let mut disabled_app = app("api", &[]);
+        disabled_app.enabled = false;
+
+        let manager = super::ProcessManager::new(
+            vec![disabled_app],
+            Arc::new(TelemetrySink::new(None)),
+        )
+        .unwrap();
+
+        let result = manager.restart_by_name("api", "manual restart").await;
+        assert_eq!(result, super::ControlResult::Disabled);
     }
 }
 

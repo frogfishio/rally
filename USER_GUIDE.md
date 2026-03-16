@@ -17,6 +17,7 @@ Once Rally is running, it gives you:
 
 - A browser dashboard showing all managed apps.
 - An optional access label for each app, so embedded UIs and local endpoints are easier to recognize.
+- Per-app enabled state, so you can keep selected apps disabled without removing them from config.
 - Live status for each app.
 - Health indicators when an app has a health check configured.
 - Per-app logs.
@@ -41,6 +42,12 @@ If the config file is somewhere else, run:
 rally --config /path/to/rally.toml
 ```
 
+You can also point Rally at a config file through the environment:
+
+```sh
+RALLY_CONFIG=/path/to/rally.toml rally
+```
+
 Then open the dashboard in your browser. By default, Rally serves it at:
 
 ```text
@@ -48,6 +55,15 @@ http://127.0.0.1:7700
 ```
 
 If your setup uses a different host or port, use the address configured in `rally.toml`.
+
+When more than one config source is available, Rally uses this precedence order:
+
+1. `--config /path/to/rally.toml`
+2. positional config path
+3. `RALLY_CONFIG`
+4. `./rally.toml`
+
+That same config resolution is also how Rally's command-line control commands find an already-running Rally instance on your machine.
 
 ---
 
@@ -59,11 +75,14 @@ On each card you can usually see:
 
 - The app name.
 - Its access point when one is configured, such as a local UI URL, port, or operator hint.
+- Whether the app is currently enabled or disabled.
 - Whether it is running, stopped, exited, or unhealthy.
 - Its process ID while running.
 - Restart count.
 - Uptime.
 - Quick actions such as restart or kill.
+
+When an app is disabled, Rally shows that clearly in the card and Info view. A disabled app is different from an app that merely exited.
 
 Selecting an app opens more detail, including logs, environment values, and operational information.
 
@@ -89,6 +108,36 @@ Use the kill control to terminate just that app.
 
 If the app is configured with automatic restart on exit, Rally may bring it back. In that case, killing it is not the same as disabling it permanently.
 
+### Disable an App
+
+Use disable when you want Rally to treat that app as unavailable until you explicitly enable it again.
+
+Disabling an app affects only that one app. Rally does not automatically disable dependents or dependencies.
+
+This is useful for local failure testing, such as disabling a database while leaving an API running so you can observe failure handling.
+
+### Enable an App
+
+Enable restores the app to an active state in Rally, but the runtime enabled flag is still separate from config reload.
+
+If the app was disabled only at runtime, reloading Rally resets it back to whatever `rally.toml` says. If `enabled` was omitted in the config, reload returns that app to the default enabled state.
+
+### Control Rally from Scripts
+
+You can control a running Rally instance without opening the dashboard.
+
+Examples:
+
+```sh
+rally start api-server
+rally stop api-server
+rally restart api-server
+rally enable worker
+rally disable worker
+```
+
+These commands do not start a new Rally server. They resolve the config file, read the configured Rally UI host and port, and send a local HTTP request to the already-running instance.
+
 ### Reload Configuration
 
 Use the reload action when `rally.toml` has changed and you want Rally to pick up the new settings.
@@ -112,6 +161,8 @@ Open the Info view for the app.
 
 Rally shows the last restart reason there, along with the configured access value, watch status, and the watch paths it registered.
 
+The Info view also shows whether the app is currently enabled.
+
 ### Open an App's Own UI
 
 Some apps managed by Rally also serve their own local UI.
@@ -129,11 +180,16 @@ If the value is not a web URL, Rally still shows it as a plain label so you can 
 The exact wording can vary by app state, but these are the main states to expect:
 
 - `running`: the app process is active.
-- `stopped`: the app is not currently running.
+- `pending`: Rally intends to run the app, but it is not yet fully running.
+- `disabled`: Rally will not start the app until it is enabled again.
 - `exited`: the app ran and then ended.
+- `killed`: the app was terminated explicitly.
+- `failed`: Rally could not start the app successfully.
 - `unhealthy`: the app process may still be running, but its configured health check is failing.
 
 An unhealthy app is often still alive as a process. It usually means the app is not responding correctly on its health endpoint.
+
+`stop` and `kill` are also different from `disable`. Stopping or killing affects the current process instance. Disabling changes Rally's runtime intent for that app.
 
 ---
 
@@ -186,6 +242,7 @@ Possible reasons include:
 - The app needs environment variables that are missing.
 - A `before` hook failed.
 - A dependency app failed to start first.
+- The app is currently disabled.
 - The app exits immediately by design or due to an error.
 
 ---
@@ -230,14 +287,46 @@ Use `access` when the thing you need to remember is how to reach the app, not ho
 
 ---
 
+## Configuring Enabled State
+
+Each app can also set `enabled` in `rally.toml`.
+
+```toml
+[[app]]
+name = "database"
+enabled = true
+command = "docker"
+args = ["compose", "up", "postgres"]
+
+[[app]]
+name = "worker"
+enabled = false
+command = "./worker"
+```
+
+If `enabled` is omitted, Rally defaults it to `true`.
+
+Runtime enable and disable actions affect only the current Rally session. Reloading the config or restarting Rally restores the config-defined value, or `true` when the field is omitted.
+
+This is intentional: runtime toggles are meant for local operator control and testing, while `rally.toml` remains the canonical source for startup behavior.
+
+---
+
 ## Useful Commands
 
 ```sh
 # Start with the default rally.toml in the current directory
 rally
 
+# Start with a config path from the environment
+RALLY_CONFIG=/path/to/rally.toml rally
+
 # Start with an explicit config file
 rally --config /path/to/rally.toml
+
+# Control an existing Rally instance
+rally restart api-server
+rally disable worker
 
 # Show help
 rally --help

@@ -16,12 +16,14 @@ port = 7700
 [[app]]
 name    = "database"
 access  = "postgres://localhost:5432/mydb"
+enabled = true
 command = "sleep"
 args    = ["3600"]
 
 [[app]]
 name    = "api-server"
 access  = "http://127.0.0.1:8080"
+enabled = true
 command = "sleep"          # replace with your real binary, e.g. "./target/debug/api-server"
 args    = ["3600"]
 depends_on = ["database"]
@@ -53,6 +55,7 @@ DATA_DIR     = "${HOME}/dev/api-data"
 [[app]]
 name    = "worker"
 access  = "queue: amqp://localhost"
+enabled = false
 command = "sleep"
 args    = ["3600"]
 depends_on = ["api-server"]
@@ -67,6 +70,7 @@ API_URL   = "http://${HOST}:8080"
 [[app]]
 name    = "frontend"
 access  = "http://127.0.0.1:3000"
+enabled = true
 command = "sleep"
 args    = ["3600"]
 

@@ -129,6 +129,7 @@ pub fn dashboard_html() -> &'static str {
   }
   .state-dot.running { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
   .state-dot.pending { background: var(--yellow); }
+  .state-dot.disabled { background: var(--text-dim); }
   .state-dot.failed  { background: var(--red); }
   .state-dot.killed  { background: var(--text-dim); }
   .state-dot.exited  { background: var(--orange); }
@@ -159,6 +160,7 @@ pub fn dashboard_html() -> &'static str {
   }
   .badge.running   { background: #052; color: var(--green); }
   .badge.pending   { background: #440; color: var(--yellow); }
+  .badge.disabled  { background: #222; color: var(--text-dim); }
   .badge.failed    { background: #400; color: var(--red); }
   .badge.killed    { background: #222; color: var(--text-dim); }
   .badge.exited    { background: #320; color: var(--orange); }
@@ -309,6 +311,14 @@ async function actionRestart(name) {
   await fetch('/api/restart/' + encodeURIComponent(name), { method: 'POST' });
 }
 
+async function actionEnable(name) {
+  await fetch('/api/enable/' + encodeURIComponent(name), { method: 'POST' });
+}
+
+async function actionDisable(name) {
+  await fetch('/api/disable/' + encodeURIComponent(name), { method: 'POST' });
+}
+
 async function actionReload() {
   const res = await fetch('/api/reload', { method: 'POST' });
   if (!res.ok) throw new Error('Reload failed ' + res.status);
@@ -399,6 +409,7 @@ function renderInfoTable(proc) {
   return `
   <table class="info-table">
     <tr><td>State</td><td><span class="badge ${sc}">${stateLabel(proc.state)}</span></td></tr>
+    <tr><td>Enabled</td><td>${proc.enabled ? 'true' : 'false'}</td></tr>
     <tr><td>PID</td><td>${proc.pid || '—'}</td></tr>
     <tr><td>Restarts</td><td>${proc.restart_count}</td></tr>
     <tr><td>Last restart</td><td>${proc.last_restart_reason ? escHtml(proc.last_restart_reason) : '—'}</td></tr>
@@ -426,6 +437,7 @@ function renderCard(proc) {
   const cmdFull = proc.command + (proc.args.length ? ' ' + proc.args.join(' ') : '');
   const accessLabel = proc.access || cmdFull;
   const accessTitle = proc.access ? proc.access : cmdFull;
+  const isEnabled = proc.enabled !== false;
   const isRunning = sc === 'running';
 
   return `
@@ -435,13 +447,17 @@ function renderCard(proc) {
       <div class="process-name">${escHtml(proc.name)}</div>
       <div class="process-cmd" title="${escAttr(accessTitle)}">${renderAccessValue(accessLabel)}</div>
       <span class="badge ${sc}">${stateLabel(proc.state)}</span>
+      ${!isEnabled ? `<span class="badge disabled">disabled</span>` : ''}
       ${proc.health !== 'not_configured' ? `<span class="badge ${hc}">${proc.health}</span>` : ''}
       <div class="process-meta">${isRunning && proc.started_at ? elapsedSince(proc.started_at) : ''}</div>
       <div class="process-actions" onclick="event.stopPropagation()">
-        ${isRunning
-          ? `<button class="btn danger" onclick="killProc('${escAttr(proc.name)}')">kill</button>`
-          : `<button class="btn primary" onclick="restartProc('${escAttr(proc.name)}')">start</button>`}
-        <button class="btn" onclick="restartProc('${escAttr(proc.name)}')">restart</button>
+        ${isEnabled
+          ? (isRunning
+              ? `<button class="btn danger" onclick="killProc('${escAttr(proc.name)}')">kill</button>`
+              : `<button class="btn primary" onclick="restartProc('${escAttr(proc.name)}')">start</button>`)
+          : `<button class="btn primary" onclick="enableProc('${escAttr(proc.name)}')">enable</button>`}
+        ${isEnabled ? `<button class="btn" onclick="restartProc('${escAttr(proc.name)}')">restart</button>` : ''}
+        ${isEnabled ? `<button class="btn" onclick="disableProc('${escAttr(proc.name)}')">disable</button>` : ''}
       </div>
     </div>
     <div class="process-detail${sel ? ' open' : ''}" id="detail-${slugify(proc.name)}">
@@ -516,6 +532,16 @@ async function killProc(name) {
 
 async function restartProc(name) {
   await actionRestart(name);
+  refresh();
+}
+
+async function enableProc(name) {
+  await actionEnable(name);
+  refresh();
+}
+
+async function disableProc(name) {
+  await actionDisable(name);
   refresh();
 }
 

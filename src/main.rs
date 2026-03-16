@@ -8,9 +8,10 @@ mod ui;
 mod web;
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, error::ErrorKind};
+use clap::{Parser, Subcommand, error::ErrorKind};
 use process_manager::ProcessManager;
 use sink::TelemetrySink;
+use std::ffi::{OsStr, OsString};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,21 +19,23 @@ use tracing::{info, warn};
 
 const DISPLAY_VERSION: &str = env!("RALLY_DISPLAY_VERSION");
 const LICENSE_SUMMARY: &str = "Copyright (C) 2026 Alexander R. Croft\nLicense: GPL-3.0-or-later\n";
+const DEFAULT_CONFIG_PATH: &str = "rally.toml";
+const CONFIG_ENV_VAR: &str = "RALLY_CONFIG";
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(
     name = "rally",
     version = DISPLAY_VERSION,
     about = "Rally your services with a local process dashboard",
-    long_about = "Rally launches and supervises multiple local development processes, serves an embedded dashboard, and can optionally forward lifecycle and process output events to a ratatouille sink.",
-    after_help = "Examples:\n  rally\n  rally --config ./rally.toml\n  rally --sink http://127.0.0.1:9100/ingest\n  rally ./custom-rally.toml"
+    long_about = "Rally launches and supervises multiple local development processes, serves an embedded dashboard, and can optionally forward lifecycle and process output events to a ratatouille sink. Config path precedence is: --config, legacy positional path, RALLY_CONFIG, then ./rally.toml.",
+    after_help = "Examples:\n  rally\n  RALLY_CONFIG=./dev.rally.toml rally\n  rally --config ./rally.toml\n  rally --sink http://127.0.0.1:9100/ingest\n  rally ./custom-rally.toml\n  rally start api-server\n  rally stop api-server\n  rally enable worker"
 )]
 struct CliArgs {
     #[arg(
         short = 'c',
         long = "config",
         value_name = "FILE",
-        help = "Path to the Rally config file",
+        help = "Path to the Rally config file (overrides RALLY_CONFIG)",
         conflicts_with = "config_path_positional"
     )]
     config_path: Option<PathBuf>,
@@ -49,6 +52,23 @@ struct CliArgs {
 
     #[arg(long = "license", help = "Print copyright and license summary")]
     license: bool,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum CliCommand {
+    /// Start an app through an existing Rally instance.
+    Start { name: String },
+    /// Stop an app through an existing Rally instance.
+    Stop { name: String },
+    /// Restart an app through an existing Rally instance.
+    Restart { name: String },
+    /// Enable an app at runtime through an existing Rally instance.
+    Enable { name: String },
+    /// Disable an app at runtime through an existing Rally instance.
+    Disable { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +78,25 @@ struct CliOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlOptions {
+    config_path: PathBuf,
+    command: ControlCommand,
+    app_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlCommand {
+    Start,
+    Stop,
+    Restart,
+    Enable,
+    Disable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     Run(CliOptions),
+    Control(ControlOptions),
     Print(String),
 }
 
@@ -70,7 +107,16 @@ fn parse_cli_args() -> Result<CliAction> {
 fn parse_cli_args_from<I, T>(args: I) -> Result<CliAction>
 where
     I: IntoIterator<Item = T>,
-    T: Into<std::ffi::OsString> + Clone,
+    T: Into<OsString> + Clone,
+{
+    parse_cli_args_from_with_env(args, |key| std::env::var_os(key))
+}
+
+fn parse_cli_args_from_with_env<I, T, F>(args: I, env_lookup: F) -> Result<CliAction>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+    F: Fn(&OsStr) -> Option<OsString>,
 {
     let args = match CliArgs::try_parse_from(args) {
         Ok(args) => args,
@@ -88,17 +134,106 @@ where
         return Ok(CliAction::Print(format_license_text()));
     }
 
+    let config_path = resolve_config_path(&args, env_lookup);
+
+    if let Some(command) = args.command {
+        let (command, app_name) = match command {
+            CliCommand::Start { name } => (ControlCommand::Start, name),
+            CliCommand::Stop { name } => (ControlCommand::Stop, name),
+            CliCommand::Restart { name } => (ControlCommand::Restart, name),
+            CliCommand::Enable { name } => (ControlCommand::Enable, name),
+            CliCommand::Disable { name } => (ControlCommand::Disable, name),
+        };
+
+        return Ok(CliAction::Control(ControlOptions {
+            config_path,
+            command,
+            app_name,
+        }));
+    }
+
     Ok(CliAction::Run(CliOptions {
-        config_path: args
-            .config_path
-            .or(args.config_path_positional)
-            .unwrap_or_else(|| PathBuf::from("rally.toml")),
+        config_path,
         sink_url: args.sink_url,
     }))
 }
 
+fn resolve_config_path<F>(args: &CliArgs, env_lookup: F) -> PathBuf
+where
+    F: Fn(&OsStr) -> Option<OsString>,
+{
+    args.config_path
+        .clone()
+        .or(args.config_path_positional.clone())
+        .or_else(|| env_lookup(OsStr::new(CONFIG_ENV_VAR)).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
+
 fn format_license_text() -> String {
     LICENSE_SUMMARY.to_owned()
+}
+
+fn control_command_name(command: ControlCommand) -> &'static str {
+    match command {
+        ControlCommand::Start => "start",
+        ControlCommand::Stop => "stop",
+        ControlCommand::Restart => "restart",
+        ControlCommand::Enable => "enable",
+        ControlCommand::Disable => "disable",
+    }
+}
+
+fn control_connect_host(host: &str) -> String {
+    match host {
+        "0.0.0.0" => "127.0.0.1".to_owned(),
+        "::" => "::1".to_owned(),
+        _ => host.to_owned(),
+    }
+}
+
+fn control_base_url(host: &str, port: u16) -> String {
+    let host = control_connect_host(host);
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+async fn run_control_command(control: ControlOptions) -> Result<()> {
+    let cfg = config::load(&control.config_path)
+        .with_context(|| format!("Could not load {}", control.config_path.display()))?;
+    let base_url = control_base_url(&cfg.ui.host, cfg.ui.port);
+    let url = format!(
+        "{}/api/{}/{}",
+        base_url,
+        control_command_name(control.command),
+        urlencoding::encode(&control.app_name)
+    );
+
+    let response = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to Rally at {}", base_url))?;
+
+    match response.status() {
+        reqwest::StatusCode::OK => Ok(()),
+        reqwest::StatusCode::NOT_FOUND => {
+            Err(anyhow!("App {} was not found in the running Rally instance", control.app_name))
+        }
+        reqwest::StatusCode::CONFLICT => Err(anyhow!(
+            "App {} is disabled; enable it before using {}",
+            control.app_name,
+            control_command_name(control.command)
+        )),
+        status => Err(anyhow!(
+            "Rally rejected {} for {} with status {}",
+            control_command_name(control.command),
+            control.app_name,
+            status
+        )),
+    }
 }
 
 #[tokio::main]
@@ -117,6 +252,10 @@ async fn main() -> Result<()> {
 
     let cli = match parse_cli_args()? {
         CliAction::Run(cli) => cli,
+        CliAction::Control(control) => {
+            run_control_command(control).await?;
+            return Ok(());
+        }
         CliAction::Print(output) => {
             print!("{output}");
             return Ok(());
@@ -200,17 +339,36 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliAction, CliArgs, DISPLAY_VERSION, format_license_text, parse_cli_args_from};
+    use super::{
+        CliAction, CliArgs, CONFIG_ENV_VAR, ControlCommand, DEFAULT_CONFIG_PATH,
+        DISPLAY_VERSION, format_license_text, parse_cli_args_from,
+        parse_cli_args_from_with_env,
+    };
     use anyhow::anyhow;
     use clap::CommandFactory;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     fn parse_from(args: &[&str]) -> anyhow::Result<super::CliOptions> {
+        parse_from_with_env(args, None)
+    }
+
+    fn parse_from_with_env(
+        args: &[&str],
+        env_config: Option<&str>,
+    ) -> anyhow::Result<super::CliOptions> {
         let mut argv = vec!["rally"];
         argv.extend_from_slice(args);
-        match parse_cli_args_from(argv)? {
+        match parse_cli_args_from_with_env(argv, |key| {
+            if key == OsStr::new(CONFIG_ENV_VAR) {
+                env_config.map(OsString::from)
+            } else {
+                None
+            }
+        })? {
             CliAction::Run(cli) => Ok(cli),
             CliAction::Print(output) => Err(anyhow!("unexpected print action: {output}")),
+            CliAction::Control(_) => Err(anyhow!("unexpected control action")),
         }
     }
 
@@ -223,8 +381,62 @@ mod tests {
     #[test]
     fn parses_default_cli_args() {
         let cli = parse_from(&[]).unwrap();
-        assert_eq!(cli.config_path, PathBuf::from("rally.toml"));
+        assert_eq!(cli.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
         assert_eq!(cli.sink_url, None);
+    }
+
+    #[test]
+    fn uses_rally_config_env_when_no_cli_path_is_provided() {
+        let cli = parse_from_with_env(&[], Some("env-rally.toml")).unwrap();
+        assert_eq!(cli.config_path, PathBuf::from("env-rally.toml"));
+    }
+
+    #[test]
+    fn explicit_config_flag_overrides_rally_config_env() {
+        let cli = parse_from_with_env(&["--config", "custom.toml"], Some("env-rally.toml")).unwrap();
+        assert_eq!(cli.config_path, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn positional_config_overrides_rally_config_env() {
+        let cli = parse_from_with_env(&["custom.toml"], Some("env-rally.toml")).unwrap();
+        assert_eq!(cli.config_path, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn parses_start_subcommand() {
+        let action = parse_action(&["start", "api-server"]).unwrap();
+        assert_eq!(
+            action,
+            CliAction::Control(super::ControlOptions {
+                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                command: ControlCommand::Start,
+                app_name: "api-server".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_control_command_with_env_config() {
+        let mut argv = vec!["rally"];
+        argv.extend_from_slice(&["enable", "worker"]);
+        let action = parse_cli_args_from_with_env(argv, |key| {
+            if key == OsStr::new(CONFIG_ENV_VAR) {
+                Some(OsString::from("env-rally.toml"))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            action,
+            CliAction::Control(super::ControlOptions {
+                config_path: PathBuf::from("env-rally.toml"),
+                command: ControlCommand::Enable,
+                app_name: "worker".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -261,6 +473,9 @@ mod tests {
         assert!(help.contains("--config"));
         assert!(help.contains("--license"));
         assert!(help.contains("--sink"));
+        assert!(help.contains(CONFIG_ENV_VAR));
+        assert!(help.contains("start"));
+        assert!(help.contains("enable"));
         assert!(help.contains("Examples:"));
     }
 
