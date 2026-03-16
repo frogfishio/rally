@@ -129,6 +129,7 @@ pub fn dashboard_html() -> &'static str {
   }
   .state-dot.running { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
   .state-dot.pending { background: var(--yellow); }
+  .state-dot.installing { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
   .state-dot.disabled { background: var(--text-dim); }
   .state-dot.failed  { background: var(--red); }
   .state-dot.killed  { background: var(--text-dim); }
@@ -160,6 +161,7 @@ pub fn dashboard_html() -> &'static str {
   }
   .badge.running   { background: #052; color: var(--green); }
   .badge.pending   { background: #440; color: var(--yellow); }
+  .badge.installing { background: #033; color: var(--accent); }
   .badge.disabled  { background: #222; color: var(--text-dim); }
   .badge.failed    { background: #400; color: var(--red); }
   .badge.killed    { background: #222; color: var(--text-dim); }
@@ -421,6 +423,7 @@ function renderInfoTable(proc) {
     <tr><td>Watch debounce</td><td>${proc.watch_debounce_millis ? proc.watch_debounce_millis + 'ms' : '—'}</td></tr>
     <tr><td>Watch paths</td><td>${watchPaths}</td></tr>
     <tr><td>Access</td><td>${renderAccessValue(proc.access)}</td></tr>
+    <tr><td>Cargo</td><td>${proc.cargo ? escHtml(proc.cargo) : '—'}</td></tr>
     <tr><td>Command</td><td>${escHtml(proc.command)}</td></tr>
     <tr><td>Args</td><td>${proc.args.length ? proc.args.map(escHtml).join(' ') : '—'}</td></tr>
   </table>`;

@@ -91,6 +91,8 @@ The Env tab shows the final environment Rally will apply to that app, including 
 
 If an app has its own embedded UI, admin page, or local endpoint, that access point can be shown directly on the card instead of the raw startup command. If the value is an `http://` or `https://` URL, you can open it directly from the dashboard in a new tab.
 
+If Rally needs to install a missing binary through Cargo, the app shows an `installing` state until the install finishes.
+
 ---
 
 ## Common Tasks
@@ -190,6 +192,7 @@ The exact wording can vary by app state, but these are the main states to expect
 
 - `running`: the app process is active.
 - `pending`: Rally intends to run the app, but it is not yet fully running.
+- `installing`: Rally is running `cargo install` because the command was not reachable.
 - `disabled`: Rally will not start the app until it is enabled again.
 - `exited`: the app ran and then ended.
 - `killed`: the app was terminated explicitly.
@@ -343,6 +346,23 @@ API_URL = "http://${HOST}:${PORT}"
 In that example, the app receives `HOST=127.0.0.1`, `LOG_LEVEL=debug`, `PORT=8080`, and `API_URL=http://127.0.0.1:8080`.
 
 Use top-level `[env]` for shared values and `[app.env]` for per-app overrides.
+
+---
+
+## Configuring Cargo Auto-Install
+
+You can optionally add a `cargo` field to an app.
+
+```toml
+[[app]]
+name = "worker"
+cargo = "frogfish-worker"
+command = "worker"
+```
+
+If Rally cannot reach `command` when starting that app and `cargo` is set, Rally runs `cargo install <target>`, shows the app as `installing`, and then retries the app launch once after the install completes.
+
+Use this when you want Rally to bootstrap runtime tools that are distributed as Cargo binaries but are not guaranteed to be installed ahead of time.
 
 ---
 

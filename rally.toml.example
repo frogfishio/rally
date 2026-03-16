@@ -61,6 +61,7 @@ DATA_DIR     = "${HOME}/dev/api-data"
 name    = "worker"
 access  = "queue: amqp://localhost"
 enabled = false
+cargo   = "frogfish-worker"
 command = "sleep"
 args    = ["3600"]
 depends_on = ["api-server"]

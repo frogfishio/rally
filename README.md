@@ -24,6 +24,7 @@ Recent changes to Rally include:
 - **Shared env blocks** — define top-level `[env]` once and merge it into every app, with `[app.env]` overriding per app.
 - **Access labels** — optionally show a friendly access URL, port, or operator hint in the dashboard instead of the raw launch command.
 - **Enabled flags** — optionally mark apps disabled in `rally.toml`, and toggle them at runtime without changing dependency behavior.
+- **Cargo auto-install** — optionally declare a cargo install target so Rally can install a missing binary and show `installing` while it does so.
 - **Lifecycle hooks** — run `before` prep commands and `after` cleanup commands around each app.
 - **Dependency ordering** — declare `depends_on` so services come up and go down in a predictable sequence.
 - **ENV interpolation** — use `${VAR}` in commands, args, workdirs, URLs, and env values.
@@ -36,6 +37,7 @@ Recent changes to Rally include:
 - **Remote control commands** — `start`, `stop`, `restart`, `enable`, and `disable` connect to an already-running Rally instance instead of starting a new one.
 - **Embedded web UI** at `http://127.0.0.1:7700` (configurable) — no external tools needed.
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
+- **Install visibility** — apps show `installing` while Rally runs `cargo install` for a missing command.
 - **Operational visibility** — the dashboard `Info` tab shows access details, enabled state, watch status, normalized watch paths, and the last restart reason for each app.
 - **Effective env view** — the dashboard `Env` tab shows the final environment Rally will run for each app after shared and app-specific env merge.
 - **Log viewer** — per-process stdout/stderr capture with filter and auto-scroll.
@@ -275,6 +277,7 @@ args    = ["compose", "up", "postgres"]
 name    = "worker"
 access  = "queue: amqp://localhost"
 enabled = false                      # start disabled until enabled later
+cargo   = "frogfish-worker"
 command = "./target/debug/worker"
 args    = ["--concurrency", "4"]
 depends_on = ["api-server"]
@@ -289,6 +292,8 @@ API_URL   = "http://${HOST}:8080"
 `depends_on = ["database", "api-server"]` starts dependencies first and stops dependents first on shutdown. Rally validates that dependency names exist, are unique, and do not form cycles.
 
 `enabled = false` keeps an app disabled at startup and after config reload. If `enabled` is omitted, Rally treats the app as enabled by default.
+
+`cargo = "crate-name"` tells Rally what to install with `cargo install` if the configured command is not reachable. Rally only attempts that install path when process launch fails with command-not-found, and it shows the app as `installing` while the install is in progress.
 
 Top-level `[env]` applies shared environment variables to every app. `[app.env]` is merged on top of that shared set, so app-specific keys override shared keys with the same name.
 

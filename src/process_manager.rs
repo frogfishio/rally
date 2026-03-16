@@ -46,6 +46,8 @@ impl std::fmt::Display for HookError {
 pub enum ProcessState {
     /// Process has not been started yet.
     Pending,
+    /// Process is being installed via cargo.
+    Installing,
     /// Process is disabled and should not be started.
     Disabled,
     /// Process is running.
@@ -62,6 +64,7 @@ impl std::fmt::Display for ProcessState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessState::Pending => write!(f, "pending"),
+            ProcessState::Installing => write!(f, "installing"),
             ProcessState::Disabled => write!(f, "disabled"),
             ProcessState::Running => write!(f, "running"),
             ProcessState::Exited(code) => write!(f, "exited({})", code),
@@ -96,6 +99,7 @@ pub struct LogLine {
 pub struct ProcessStatus {
     pub name: String,
     pub access: Option<String>,
+    pub cargo: Option<String>,
     pub enabled: bool,
     pub command: String,
     pub args: Vec<String>,
@@ -203,6 +207,7 @@ impl ManagedProcess {
         ProcessStatus {
             name: self.config.name.clone(),
             access: self.config.access.clone(),
+            cargo: self.config.cargo.clone(),
             enabled: inner.enabled,
             command: self.config.command.clone(),
             args: self.config.args.clone(),
@@ -291,6 +296,7 @@ impl ManagedProcess {
         let telemetry = self.telemetry.clone();
 
         tokio::spawn(async move {
+            let mut install_attempted = false;
             loop {
                 if let Err(error) = run_hooks(
                     &config.name,
@@ -333,6 +339,29 @@ impl ManagedProcess {
 
                 match cmd.spawn() {
                     Err(e) => {
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && config.cargo.is_some()
+                            && !install_attempted
+                        {
+                            install_attempted = true;
+                            match run_cargo_install(&config, &inner_arc, &change_tx, &telemetry).await {
+                                Ok(()) => continue,
+                                Err(error) => {
+                                    error!(name = %config.name, error = %error, "Cargo install failed");
+                                    telemetry.emit(
+                                        "rally:process",
+                                        format!("cargo install failed for {}: {}", config.name, error),
+                                    );
+                                    let mut inner = inner_arc.write().await;
+                                    inner.state = ProcessState::Failed;
+                                    inner.exit_time = Some(Utc::now());
+                                    inner.push_log("stderr", format!("Cargo install failed: {}", error));
+                                    let _ = change_tx.send(());
+                                    break;
+                                }
+                            }
+                        }
+
                         error!(name = %config.name, error = %e, "Failed to spawn process");
                         telemetry.emit(
                             "rally:process",
@@ -345,6 +374,7 @@ impl ManagedProcess {
                         break;
                     }
                     Ok(mut child) => {
+                        install_attempted = false;
                         let pid = child.id();
                         info!(name = %config.name, pid = ?pid, "Process started");
                         telemetry.emit(
@@ -609,9 +639,9 @@ fn capture_hook_output(
     });
 }
 
-fn capture_process_output(
+fn capture_named_output(
     app_name: String,
-    stream: &'static str,
+    stream: String,
     pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     inner_arc: Arc<RwLock<Inner>>,
     change_tx: broadcast::Sender<()>,
@@ -620,10 +650,28 @@ fn capture_process_output(
     tokio::spawn(async move {
         let mut reader = BufReader::new(pipe).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            telemetry.emit_process_output(&app_name, stream, &line);
-            push_process_log(&inner_arc, &change_tx, stream, line).await;
+            telemetry.emit_process_output(&app_name, &stream, &line);
+            push_process_log(&inner_arc, &change_tx, &stream, line).await;
         }
     });
+}
+
+fn capture_process_output(
+    app_name: String,
+    stream: &'static str,
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    inner_arc: Arc<RwLock<Inner>>,
+    change_tx: broadcast::Sender<()>,
+    telemetry: Arc<TelemetrySink>,
+) {
+    capture_named_output(
+        app_name,
+        stream.to_owned(),
+        pipe,
+        inner_arc,
+        change_tx,
+        telemetry,
+    );
 }
 
 async fn push_process_log(
@@ -635,6 +683,96 @@ async fn push_process_log(
     let mut inner = inner_arc.write().await;
     inner.push_log(stream, message);
     let _ = change_tx.send(());
+}
+
+async fn run_cargo_install(
+    config: &AppConfig,
+    inner_arc: &Arc<RwLock<Inner>>,
+    change_tx: &broadcast::Sender<()>,
+    telemetry: &Arc<TelemetrySink>,
+) -> Result<()> {
+    let cargo_target = config
+        .cargo
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing cargo install target"))?;
+
+    {
+        let mut inner = inner_arc.write().await;
+        inner.state = ProcessState::Installing;
+        inner.pid = None;
+        inner.started_at = None;
+        inner.health = initial_health_status(config);
+        inner.push_log(
+            "stderr",
+            format!("Installing missing command via `cargo install {}`", cargo_target),
+        );
+        let _ = change_tx.send(());
+    }
+
+    telemetry.emit(
+        "rally:process",
+        format!("installing {} via cargo install {}", config.name, cargo_target),
+    );
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("install").arg(cargo_target);
+    if let Some(ref wd) = config.workdir {
+        cmd.current_dir(wd);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| anyhow!("failed to spawn cargo install: {}", error))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        capture_named_output(
+            config.name.clone(),
+            "install:stdout".to_owned(),
+            stdout,
+            inner_arc.clone(),
+            change_tx.clone(),
+            telemetry.clone(),
+        );
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        capture_named_output(
+            config.name.clone(),
+            "install:stderr".to_owned(),
+            stderr,
+            inner_arc.clone(),
+            change_tx.clone(),
+            telemetry.clone(),
+        );
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| anyhow!("cargo install wait failed: {}", error))?;
+
+    if status.success() {
+        telemetry.emit(
+            "rally:process",
+            format!("cargo install succeeded for {} target={}", config.name, cargo_target),
+        );
+        push_process_log(
+            inner_arc,
+            change_tx,
+            "stderr",
+            format!("cargo install {} completed", cargo_target),
+        )
+        .await;
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "cargo install {} exited with code {}",
+        cargo_target,
+        status.code().unwrap_or(-1)
+    ))
 }
 
 /// Central registry that owns all managed processes.
@@ -1173,6 +1311,7 @@ mod tests {
         AppConfig {
             name: name.to_owned(),
             access: None,
+            cargo: None,
             enabled: true,
             command: name.to_owned(),
             workdir: None,

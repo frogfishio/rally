@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub name: String,
     /// Optional dashboard-friendly access string shown instead of the launch command.
     pub access: Option<String>,
+    /// Optional cargo install target used when the command is not reachable.
+    pub cargo: Option<String>,
     /// Whether the app is enabled at startup and after config reload (default: true).
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -180,6 +182,14 @@ fn interpolate_config(mut config: Config) -> Result<Config> {
             .map(|value| {
                 interpolate_string(value, &app_scope)
                     .with_context(|| format!("Failed to resolve access for app {}", app.name))
+            })
+            .transpose()?;
+        app.cargo = app
+            .cargo
+            .as_ref()
+            .map(|value| {
+                interpolate_string(value, &app_scope)
+                    .with_context(|| format!("Failed to resolve cargo target for app {}", app.name))
             })
             .transpose()?;
         app.command = interpolate_string(&app.command, &app_scope)
@@ -373,6 +383,7 @@ command = "/usr/bin/myapp"
         let app = &cfg.app[0];
         assert_eq!(app.name, "myapp");
         assert_eq!(app.access, None);
+        assert_eq!(app.cargo, None);
         assert!(app.enabled);
         assert_eq!(app.command, "/usr/bin/myapp");
         assert!(app.args.is_empty());
@@ -392,6 +403,7 @@ command = "/usr/bin/myapp"
 [[app]]
 name    = "server"
 access  = "http://localhost:8080"
+cargo   = "frogfish-server"
 enabled = false
 command = "./server"
 args    = ["--port", "8080"]
@@ -405,6 +417,7 @@ LOG  = "debug"
         let cfg = parse(toml).unwrap();
         let app = &cfg.app[0];
         assert_eq!(app.access.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(app.cargo.as_deref(), Some("frogfish-server"));
         assert!(!app.enabled);
         assert_eq!(app.args, vec!["--port", "8080"]);
         assert!(app.restart_on_exit);
@@ -541,6 +554,7 @@ health_interval_secs = 30
 [[app]]
 name = "svc"
 access = "http://${{HOST}}:8080"
+cargo = "svc-installer-${{HOST}}"
 command = "${{{home_var}}}/bin/svc"
     args = ["--data=${{DATA_DIR}}"]
 workdir = "${{{home_var}}}/workspace"
@@ -564,6 +578,7 @@ command = "echo"
         let cfg = parse(&toml).unwrap();
         let app = &cfg.app[0];
         assert_eq!(app.access.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(app.cargo.as_deref(), Some("svc-installer-127.0.0.1"));
         assert_eq!(app.command, format!("{}/bin/svc", home));
         assert_eq!(app.args, vec![format!("--data={}/data", home)]);
         let expected_workdir = format!("{}/workspace", home);
