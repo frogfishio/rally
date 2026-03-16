@@ -18,6 +18,7 @@ Once Rally is running, it gives you:
 - A browser dashboard showing all managed apps.
 - An optional access label for each app, so embedded UIs and local endpoints are easier to recognize.
 - Per-app enabled state, so you can keep selected apps disabled without removing them from config.
+- Effective env visibility, so you can inspect the final env Rally applies to each app.
 - Live status for each app.
 - Health indicators when an app has a health check configured.
 - Per-app logs.
@@ -85,6 +86,8 @@ On each card you can usually see:
 When an app is disabled, Rally shows that clearly in the card and Info view. A disabled app is different from an app that merely exited.
 
 Selecting an app opens more detail, including logs, environment values, and operational information.
+
+The Env tab shows the final environment Rally will apply to that app, including any shared `[env]` values from the top of `rally.toml` plus that app's own `[app.env]` overrides.
 
 If an app has its own embedded UI, admin page, or local endpoint, that access point can be shown directly on the card instead of the raw startup command. If the value is an `http://` or `https://` URL, you can open it directly from the dashboard in a new tab.
 
@@ -154,6 +157,12 @@ Use this first when an app:
 - Keeps restarting.
 - Reports unhealthy.
 - Looks idle when it should be doing work.
+
+### Inspect Effective Environment
+
+Open the Env view for an app when you need to confirm which environment variables are actually in play.
+
+Rally shows the final merged environment, not just the app-local overrides. That is useful when some values come from a shared top-level `[env]` block and others come from `[app.env]`.
 
 ### Check Why Something Restarted
 
@@ -309,6 +318,31 @@ If `enabled` is omitted, Rally defaults it to `true`.
 Runtime enable and disable actions affect only the current Rally session. Reloading the config or restarting Rally restores the config-defined value, or `true` when the field is omitted.
 
 This is intentional: runtime toggles are meant for local operator control and testing, while `rally.toml` remains the canonical source for startup behavior.
+
+---
+
+## Configuring Shared Environment Variables
+
+You can define shared environment variables once at the top level of `rally.toml`.
+
+```toml
+[env]
+HOST = "127.0.0.1"
+LOG_LEVEL = "info"
+
+[[app]]
+name = "api"
+command = "./api"
+
+[app.env]
+LOG_LEVEL = "debug"
+PORT = "8080"
+API_URL = "http://${HOST}:${PORT}"
+```
+
+In that example, the app receives `HOST=127.0.0.1`, `LOG_LEVEL=debug`, `PORT=8080`, and `API_URL=http://127.0.0.1:8080`.
+
+Use top-level `[env]` for shared values and `[app.env]` for per-app overrides.
 
 ---
 

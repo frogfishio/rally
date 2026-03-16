@@ -10,6 +10,8 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
     pub app: Vec<AppConfig>,
     #[serde(default)]
     pub ui: UiConfig,
@@ -154,14 +156,21 @@ pub fn parse(toml: &str) -> Result<Config> {
 
 fn interpolate_config(mut config: Config) -> Result<Config> {
     let process_env: HashMap<String, String> = std::env::vars().collect();
+    let shared_env = resolve_env_map(&config.env, &process_env)
+        .with_context(|| "Failed to resolve shared env")?;
+    config.env = shared_env.clone();
+    let mut shared_scope = process_env.clone();
+    shared_scope.extend(shared_env.clone());
 
     for app in &mut config.app {
-        let resolved_env = resolve_env_map(&app.env, &process_env)
+        let resolved_env = resolve_env_map(&app.env, &shared_scope)
             .with_context(|| format!("Failed to resolve env for app {}", app.name))?;
-        app.env = resolved_env.clone();
+        let mut effective_env = shared_env.clone();
+        effective_env.extend(resolved_env.clone());
+        app.env = effective_env.clone();
 
         let mut app_scope = process_env.clone();
-        app_scope.extend(resolved_env.clone());
+        app_scope.extend(effective_env.clone());
 
         app.name = interpolate_string(&app.name, &app_scope)
             .with_context(|| "Failed to resolve app name")?;
@@ -346,6 +355,7 @@ mod tests {
     #[test]
     fn empty_config_is_valid() {
         let cfg = parse("").unwrap();
+        assert!(cfg.env.is_empty());
         assert!(cfg.app.is_empty());
         assert_eq!(cfg.ui.port, 7700);
         assert_eq!(cfg.ui.host, "127.0.0.1");
@@ -458,6 +468,9 @@ port = 9000
     #[test]
     fn multiple_apps() {
         let toml = r#"
+[env]
+SHARED = "1"
+
 [[app]]
 name    = "a"
 command = "a"
@@ -468,8 +481,38 @@ command = "b"
 "#;
         let cfg = parse(toml).unwrap();
         assert_eq!(cfg.app.len(), 2);
+        assert_eq!(cfg.env["SHARED"], "1");
         assert_eq!(cfg.app[0].name, "a");
         assert_eq!(cfg.app[1].name, "b");
+        assert_eq!(cfg.app[0].env["SHARED"], "1");
+        assert_eq!(cfg.app[1].env["SHARED"], "1");
+    }
+
+    #[test]
+    fn merges_shared_env_into_each_app_with_app_override() {
+        let toml = r#"
+[env]
+HOST = "127.0.0.1"
+LOG_LEVEL = "info"
+
+[[app]]
+name = "api"
+command = "./api"
+
+[app.env]
+LOG_LEVEL = "debug"
+PORT = "8080"
+API_URL = "http://${HOST}:${PORT}"
+"#;
+
+        let cfg = parse(toml).unwrap();
+        let app = &cfg.app[0];
+
+        assert_eq!(cfg.env["HOST"], "127.0.0.1");
+        assert_eq!(app.env["HOST"], "127.0.0.1");
+        assert_eq!(app.env["LOG_LEVEL"], "debug");
+        assert_eq!(app.env["PORT"], "8080");
+        assert_eq!(app.env["API_URL"], "http://127.0.0.1:8080");
     }
 
     #[test]

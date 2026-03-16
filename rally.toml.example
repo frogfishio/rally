@@ -11,6 +11,11 @@
 host = "127.0.0.1"
 port = 7700
 
+# ── Shared environment (optional) ─────────────────────────────────────────
+[env]
+HOST      = "127.0.0.1"
+LOG_LEVEL = "info"
+
 # ── Application definitions ───────────────────────────────────────────────
 
 [[app]]
@@ -64,7 +69,6 @@ restart_on_exit = true
 [app.env]
 QUEUE_URL = "amqp://localhost"
 WORKERS   = "4"
-HOST      = "127.0.0.1"
 API_URL   = "http://${HOST}:8080"
 
 [[app]]

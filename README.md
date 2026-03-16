@@ -21,6 +21,7 @@ Recent changes to Rally include:
 ## Features
 
 - **`rally.toml` config** — define any number of apps with command, arguments, optional dashboard access labels, environment variables, working directory, and optional HTTP health checks.
+- **Shared env blocks** — define top-level `[env]` once and merge it into every app, with `[app.env]` overriding per app.
 - **Access labels** — optionally show a friendly access URL, port, or operator hint in the dashboard instead of the raw launch command.
 - **Enabled flags** — optionally mark apps disabled in `rally.toml`, and toggle them at runtime without changing dependency behavior.
 - **Lifecycle hooks** — run `before` prep commands and `after` cleanup commands around each app.
@@ -36,6 +37,7 @@ Recent changes to Rally include:
 - **Embedded web UI** at `http://127.0.0.1:7700` (configurable) — no external tools needed.
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
 - **Operational visibility** — the dashboard `Info` tab shows access details, enabled state, watch status, normalized watch paths, and the last restart reason for each app.
+- **Effective env view** — the dashboard `Env` tab shows the final environment Rally will run for each app after shared and app-specific env merge.
 - **Log viewer** — per-process stdout/stderr capture with filter and auto-scroll.
 - **Start / Stop / Enable / Disable** — control individual processes from the dashboard or CLI.
 - **Auto-restart** — optional `restart_on_exit = true` to keep processes alive.
@@ -226,6 +228,11 @@ The dashboard `Info` tab shows whether watching is enabled, the normalized watch
 host = "127.0.0.1"
 port = 7700
 
+# Shared environment variables applied to every app (optional)
+[env]
+HOST = "127.0.0.1"
+LOG_LEVEL = "info"
+
 # Define as many [[app]] entries as you like
 [[app]]
 name    = "api-server"
@@ -255,7 +262,7 @@ args    = ["-f", ".api-server.lock"]
 
 [app.env]
 DATABASE_URL = "postgres://localhost/mydb"
-LOG_LEVEL    = "debug"
+LOG_LEVEL    = "debug"                 # overrides top-level [env]
 DATA_DIR     = "${HOME}/dev/api-data"
 
 [[app]]
@@ -283,15 +290,19 @@ API_URL   = "http://${HOST}:8080"
 
 `enabled = false` keeps an app disabled at startup and after config reload. If `enabled` is omitted, Rally treats the app as enabled by default.
 
+Top-level `[env]` applies shared environment variables to every app. `[app.env]` is merged on top of that shared set, so app-specific keys override shared keys with the same name.
+
 The runtime enabled flag is dynamic and per-app. Disabling an app does not walk dependencies or stop dependents automatically; it affects only that app. Reloading the config resets runtime enable state back to the value in `rally.toml`.
 
-`ENV` interpolation uses `${VAR}` syntax. Rally resolves values from the current process environment first, then app and hook `env` entries with deterministic cycle detection and unknown-variable errors.
+`ENV` interpolation uses `${VAR}` syntax. Rally resolves shared `[env]` from the current process environment first, then resolves `[app.env]` against the shared env, and finally resolves hook env against the app's effective env with deterministic cycle detection and unknown-variable errors.
 
 See [`rally.toml.example`](rally.toml.example) for a full example.
 
 If `access` is set, the dashboard shows that value in the app card instead of the launch command line. This is useful for apps that expose their own embedded UI, local admin page, port, or setup hint and are easier to operate by access point than by startup command.
 
 Values beginning with `http://` or `https://` render as links that open in a new tab. Other values such as `localhost:5432`, `queue: amqp://localhost`, or `admin on port 9090` are shown as plain text.
+
+The dashboard `Env` tab shows the effective env for each app after shared `[env]` and app-specific `[app.env]` are merged.
 
 ---
 
