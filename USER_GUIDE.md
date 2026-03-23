@@ -16,6 +16,7 @@ Rally reads a `rally.toml` file and starts the apps listed there.
 Once Rally is running, it gives you:
 
 - A browser dashboard showing all managed apps.
+- An optional top-level env provider command, so shared packs can pull secrets or profile-scoped values from external tools before Rally resolves `[env]` and `[app.env]`.
 - An optional access label for each app, so embedded UIs and local endpoints are easier to recognize.
 - Per-app enabled state, so you can keep selected apps disabled without removing them from config.
 - Effective env visibility, so you can inspect the final env Rally applies to each app.
@@ -89,9 +90,15 @@ Selecting an app opens more detail, including logs, environment values, and oper
 
 The Env tab shows the final environment Rally will apply to that app, including any shared `[env]` values from the top of `rally.toml` plus that app's own `[app.env]` overrides.
 
+If the config uses `[env_command]`, those provider-loaded values are included in the final environment before Rally applies shared and app-specific overrides.
+
+By default, the Env tab shows only managed values that came from Rally config or the env provider. You can switch it to show the full inherited environment when you need to inspect ambient variables passed through from the Rally process.
+
 If an app has its own embedded UI, admin page, or local endpoint, that access point can be shown directly on the card instead of the raw startup command. If the value is an `http://` or `https://` URL, you can open it directly from the dashboard in a new tab.
 
 If Rally needs to install a missing binary through Cargo, the app shows an `installing` state until the install finishes.
+
+The Info tab also shows whether an env provider is active, how many keys it loaded, and when Rally last refreshed that provider state.
 
 ---
 

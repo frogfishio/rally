@@ -22,6 +22,7 @@ Recent changes to Rally include:
 
 - **`rally.toml` config** — define any number of apps with command, arguments, optional dashboard access labels, environment variables, working directory, and optional HTTP health checks.
 - **Shared env blocks** — define top-level `[env]` once and merge it into every app, with `[app.env]` overriding per app.
+- **External env providers** — optionally run one top-level `[env_command]` at load and reload time to populate the base environment from tools such as `macrun` without wrapper scripts or repo-local `.env` files.
 - **Access labels** — optionally show a friendly access URL, port, or operator hint in the dashboard instead of the raw launch command.
 - **Enabled flags** — optionally mark apps disabled in `rally.toml`, and toggle them at runtime without changing dependency behavior.
 - **Cargo auto-install** — optionally declare a cargo install target so Rally can install a missing binary and show `installing` while it does so.
@@ -39,7 +40,8 @@ Recent changes to Rally include:
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
 - **Install visibility** — apps show `installing` while Rally runs `cargo install` for a missing command.
 - **Operational visibility** — the dashboard `Info` tab shows access details, enabled state, watch status, normalized watch paths, and the last restart reason for each app.
-- **Effective env view** — the dashboard `Env` tab shows the final environment Rally will run for each app after shared and app-specific env merge.
+- **Effective env view** — the dashboard `Env` tab shows the final environment Rally will run for each app after inherited env, optional env provider, shared env, and app-specific env merge, with a managed-only filter to hide ambient inherited variables by default.
+- **Provider visibility** — the dashboard `Info` tab shows whether an env provider is active, how many keys it loaded, and when it was last refreshed.
 - **Log viewer** — per-process stdout/stderr capture with filter and auto-scroll.
 - **Start / Stop / Enable / Disable** — control individual processes from the dashboard or CLI.
 - **Auto-restart** — optional `restart_on_exit = true` to keep processes alive.
@@ -187,6 +189,38 @@ Config path precedence is deterministic:
 2. legacy positional config path
 3. `RALLY_CONFIG`
 4. `./rally.toml`
+
+## Environment Providers
+
+Rally can optionally populate its base environment from an external command before resolving `[env]` and `[app.env]`.
+
+This is useful when a separate tool is the source of truth for local development secrets or profile-scoped configuration.
+
+Example:
+
+```toml
+[env_command]
+command = "macrun"
+args = ["--project", "my-pack", "--profile", "dev", "env", "--format", "json"]
+format = "json"
+timeout_ms = 5000
+override_existing = false
+```
+
+Resolution order is:
+
+1. Rally inherits its own process environment.
+2. Rally runs `[env_command]` once at startup and again on config reload.
+3. Provider values are merged into the inherited environment.
+4. Top-level `[env]` resolves against that base environment.
+5. Each `[app.env]` resolves against the app's effective environment.
+
+Supported output formats:
+
+- `format = "json"` expects a single JSON object whose keys and values are all strings.
+- `format = "shell"` expects only `export NAME=VALUE` lines plus optional comments or blank lines.
+
+Provider stdout is treated as configuration payload. Rally does not forward it to app logs, the dashboard log panes, or optional ratatouille sinks.
 
 The remote control commands use that same config resolution to find the running Rally instance, then connect to the configured UI host and port over HTTP.
 

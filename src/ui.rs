@@ -296,6 +296,7 @@ let selectedName = null;
 let activeTab = {};   // name -> tab id
 let autoscroll = {};  // name -> bool
 let logFilter = {};   // name -> string
+let envMode = {};     // name -> managed | all
 let pollInterval = null;
 
 // ── API ────────────────────────────────────────────────────────────────────
@@ -403,15 +404,46 @@ function renderEnv(env) {
   ).join('') + '</div>';
 }
 
+function getEnvMode(name) { return envMode[name] || 'managed'; }
+
+function renderEnvPanel(proc) {
+  const mode = getEnvMode(proc.name);
+  const visibleEnv = mode === 'all' ? (proc.env || {}) : (proc.managed_env || {});
+  const managedCount = Object.keys(proc.managed_env || {}).length;
+  const totalCount = Object.keys(proc.env || {}).length;
+  const ambientCount = Math.max(0, totalCount - managedCount);
+
+  return `
+    <div class="log-controls">
+      <div class="process-meta">showing ${mode === 'all' ? totalCount : managedCount} env vars${mode === 'managed' && ambientCount ? `, hiding ${ambientCount} ambient` : ''}</div>
+      <div class="process-actions">
+        <button class="btn${mode === 'managed' ? ' primary' : ''}" onclick="setEnvMode('${escAttr(proc.name)}','managed')">managed</button>
+        <button class="btn${mode === 'all' ? ' primary' : ''}" onclick="setEnvMode('${escAttr(proc.name)}','all')">all</button>
+      </div>
+    </div>
+    ${renderEnv(visibleEnv)}
+  `;
+}
+
 function renderInfoTable(proc) {
   const sc = stateClass(proc.state);
   const watchPaths = (proc.watch_paths || []).length
     ? proc.watch_paths.map(escHtml).join('<br>')
     : '—';
+  const envProvider = proc.env_provider || null;
+  const envProviderLoadedAt = envProvider && envProvider.loaded_at
+    ? fmtTs(envProvider.loaded_at)
+    : '—';
   return `
   <table class="info-table">
     <tr><td>State</td><td><span class="badge ${sc}">${stateLabel(proc.state)}</span></td></tr>
     <tr><td>Enabled</td><td>${proc.enabled ? 'true' : 'false'}</td></tr>
+    <tr><td>Env provider</td><td>${envProvider ? 'enabled' : 'disabled'}</td></tr>
+    <tr><td>Provider status</td><td>${envProvider ? escHtml(envProvider.status) : '—'}</td></tr>
+    <tr><td>Provider command</td><td>${envProvider ? escHtml(envProvider.command) : '—'}</td></tr>
+    <tr><td>Provider format</td><td>${envProvider ? escHtml(envProvider.format) : '—'}</td></tr>
+    <tr><td>Provider keys</td><td>${envProvider ? envProvider.key_count : '—'}</td></tr>
+    <tr><td>Provider loaded</td><td>${envProviderLoadedAt}</td></tr>
     <tr><td>PID</td><td>${proc.pid || '—'}</td></tr>
     <tr><td>Restarts</td><td>${proc.restart_count}</td></tr>
     <tr><td>Last restart</td><td>${proc.last_restart_reason ? escHtml(proc.last_restart_reason) : '—'}</td></tr>
@@ -437,6 +469,8 @@ function renderCard(proc) {
   const hc    = healthClass(proc.health);
   const sel   = proc.name === selectedName;
   const tab   = getTab(proc.name);
+  const managedCount = Object.keys(proc.managed_env || {}).length;
+  const totalCount = Object.keys(proc.env || {}).length;
   const cmdFull = proc.command + (proc.args.length ? ' ' + proc.args.join(' ') : '');
   const accessLabel = proc.access || cmdFull;
   const accessTitle = proc.access ? proc.access : cmdFull;
@@ -467,7 +501,7 @@ function renderCard(proc) {
       <div class="detail-tabs">
         <button class="tab-btn${tab==='info'?' active':''}" onclick="switchTab('${escAttr(proc.name)}','info')">Info</button>
         <button class="tab-btn${tab==='logs'?' active':''}" onclick="switchTab('${escAttr(proc.name)}','logs')">Logs (${proc.logs.length})</button>
-        <button class="tab-btn${tab==='env'?' active':''}" onclick="switchTab('${escAttr(proc.name)}','env')">Env</button>
+        <button class="tab-btn${tab==='env'?' active':''}" onclick="switchTab('${escAttr(proc.name)}','env')">Env (${managedCount}/${totalCount})</button>
       </div>
       <div class="tab-panel${tab==='info'?' active':''}" id="tab-info-${slugify(proc.name)}">
         ${renderInfoTable(proc)}
@@ -481,7 +515,7 @@ function renderCard(proc) {
         <div class="log-viewer" id="logs-${slugify(proc.name)}">${renderLogs(proc)}</div>
       </div>
       <div class="tab-panel${tab==='env'?' active':''}" id="tab-env-${slugify(proc.name)}">
-        ${renderEnv(proc.env)}
+        ${renderEnvPanel(proc)}
       </div>
     </div>
   </div>`;
@@ -521,6 +555,11 @@ function setLogFilter(name, val) {
 
 function setAutoScroll(name, val) {
   autoscroll[name] = val;
+}
+
+function setEnvMode(name, mode) {
+  envMode[name] = mode;
+  refresh();
 }
 
 async function clearLogs(name) {

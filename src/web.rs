@@ -6,25 +6,32 @@ use crate::process_manager::{ControlResult, SharedManager};
 use crate::sink::TelemetrySink;
 use crate::ui::dashboard_html;
 use axum::{
+    body::{to_bytes, Body},
     extract::{Path, State},
+    http::Request,
     http::StatusCode,
     response::{Html, IntoResponse, Sse},
     routing::{get, post},
     Json, Router,
 };
 use axum::response::sse::{Event, KeepAlive};
+use futures_util::stream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio_stream::StreamExt;
+
+#[cfg(test)]
+use tower::ServiceExt;
 
 pub struct AppState {
     config_path: PathBuf,
     http_client: reqwest::Client,
     manager: RwLock<SharedManager>,
     telemetry: Arc<TelemetrySink>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 pub type SharedAppState = Arc<AppState>;
@@ -36,11 +43,13 @@ impl AppState {
         manager: SharedManager,
         telemetry: Arc<TelemetrySink>,
     ) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             config_path,
             http_client,
             manager: RwLock::new(manager),
             telemetry,
+            shutdown_tx,
         }
     }
 
@@ -53,10 +62,11 @@ impl AppState {
             "rally:lifecycle",
             format!("reloading config from {}", self.config_path.display()),
         );
-        let cfg = config::load(&self.config_path)?;
+        let cfg = config::load_with_telemetry(&self.config_path, Some(self.telemetry.as_ref()))?;
         let new_manager = Arc::new(crate::process_manager::ProcessManager::new(
             cfg.app.clone(),
             self.telemetry.clone(),
+            cfg.env_provider_info.clone(),
         )?);
 
         let mut manager = self.manager.write().await;
@@ -76,10 +86,15 @@ impl AppState {
     }
 
     pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
         let manager = self.current_manager().await;
         manager.kill_all().await;
         manager.abort_health_tasks();
         manager.abort_watch_tasks();
+    }
+
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
     }
 }
 
@@ -229,6 +244,7 @@ async fn sse_handler(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let mgr = state.current_manager().await;
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
+    let shutdown_rx = state.subscribe_shutdown();
 
     for proc in &mgr.processes {
         let p = proc.lock().await;
@@ -244,8 +260,111 @@ async fn sse_handler(
     }
     drop(tx);
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-        .map(|_| Ok::<Event, Infallible>(Event::default().data("update")));
+    let stream = stream::unfold((rx, shutdown_rx), |(mut rx, mut shutdown_rx)| async move {
+        tokio::select! {
+            message = rx.recv() => match message {
+                Some(_) => Some((Ok::<Event, Infallible>(Event::default().data("update")), (rx, shutdown_rx))),
+                None => None,
+            },
+            changed = shutdown_rx.changed() => match changed {
+                Ok(()) if *shutdown_rx.borrow() => None,
+                Ok(()) => Some((Ok::<Event, Infallible>(Event::default().data("update")), (rx, shutdown_rx))),
+                Err(_) => None,
+            }
+        }
+    });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_manager::ProcessManager;
+    use crate::sink::TelemetrySink;
+    use serde_json::Value;
+    use std::fs;
+
+    fn temp_config_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rally-web-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn reload_endpoint_rebuilds_manager_from_updated_config() {
+        let temp_dir = temp_config_dir("reload");
+        let config_path = temp_dir.join("rally.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[app]]
+name = "first"
+command = "sleep"
+args = ["1"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = config::load(&config_path).unwrap();
+        let manager = Arc::new(
+            ProcessManager::new(cfg.app.clone(), Arc::new(TelemetrySink::new(None)), cfg.env_provider_info.clone())
+                .unwrap(),
+        );
+        let http_client = reqwest::Client::builder().build().unwrap();
+        let state = Arc::new(AppState::new(
+            config_path.clone(),
+            http_client,
+            manager,
+            Arc::new(TelemetrySink::new(None)),
+        ));
+        let app = router(state);
+
+        fs::write(
+            &config_path,
+            r#"
+[[app]]
+name = "second"
+command = "sleep"
+args = ["1"]
+"#,
+        )
+        .unwrap();
+
+        let reload_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload_response.status(), StatusCode::OK);
+
+        let status_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+
+        let body = to_bytes(status_response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.as_array().unwrap().len(), 1);
+        assert_eq!(payload[0]["name"], "second");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

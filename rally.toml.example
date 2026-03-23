@@ -11,6 +11,15 @@
 host = "127.0.0.1"
 port = 7700
 
+# ── External environment provider (optional) ──────────────────────────────
+[env_command]
+command = "macrun"
+args = ["--project", "example-pack", "--profile", "dev", "env", "--format", "json"]
+format = "json"
+timeout_ms = 5000
+override_existing = false
+# workdir = "."
+
 # ── Shared environment (optional) ─────────────────────────────────────────
 [env]
 HOST      = "127.0.0.1"

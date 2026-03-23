@@ -263,10 +263,9 @@ async fn main() -> Result<()> {
     };
     let config_path = cli.config_path.clone();
 
-    let cfg = config::load(&config_path)
-        .with_context(|| format!("Could not load {}", config_path.display()))?;
-
     let telemetry = Arc::new(TelemetrySink::new(cli.sink_url.clone()));
+    let cfg = config::load_with_telemetry(&config_path, Some(telemetry.as_ref()))
+        .with_context(|| format!("Could not load {}", config_path.display()))?;
     telemetry.emit(
         "rally:lifecycle",
         format!("loaded config from {}", config_path.display()),
@@ -285,7 +284,11 @@ async fn main() -> Result<()> {
         .context("Invalid UI host/port")?;
 
     // Build process manager
-    let manager = Arc::new(ProcessManager::new(cfg.app.clone(), telemetry.clone())?);
+    let manager = Arc::new(ProcessManager::new(
+        cfg.app.clone(),
+        telemetry.clone(),
+        cfg.env_provider_info.clone(),
+    )?);
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -316,12 +319,14 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to bind to {}", ui_addr))?;
 
     // Graceful shutdown: stop all children on Ctrl-C
+    let shutdown_state = state.clone();
     let shutdown = async move {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to listen for Ctrl-C");
         info!("Shutting down…");
         telemetry.emit("rally:lifecycle", "shutdown requested".to_owned());
+        shutdown_state.shutdown().await;
     };
 
     axum::serve(listener, app)

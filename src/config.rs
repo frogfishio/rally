@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Alexander R. Croft
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use crate::sink::TelemetrySink;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Root configuration loaded from `rally.toml`.
 #[derive(Debug, Deserialize, Clone)]
@@ -15,6 +22,40 @@ pub struct Config {
     pub app: Vec<AppConfig>,
     #[serde(default)]
     pub ui: UiConfig,
+    pub env_command: Option<EnvCommandConfig>,
+    #[serde(skip)]
+    pub env_provider_info: Option<EnvProviderInfo>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EnvCommandConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub format: EnvCommandFormat,
+    #[serde(default = "default_env_command_timeout_ms")]
+    pub timeout_ms: u64,
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub override_existing: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvCommandFormat {
+    Json,
+    Shell,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct EnvProviderInfo {
+    pub status: String,
+    pub command: String,
+    pub format: EnvCommandFormat,
+    pub override_existing: bool,
+    pub key_count: usize,
+    pub duration_ms: u64,
+    pub loaded_at: DateTime<Utc>,
 }
 
 /// Per-application configuration entry.
@@ -39,6 +80,9 @@ pub struct AppConfig {
     /// Environment variables injected into the process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Managed subset of the effective environment contributed by Rally config or env_command.
+    #[serde(skip)]
+    pub managed_env: HashMap<String, String>,
     /// Other apps that must be started before this app.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -140,39 +184,66 @@ fn default_watch_debounce_millis() -> u64 {
     500
 }
 
+fn default_env_command_timeout_ms() -> u64 {
+    5_000
+}
+
 /// Load and parse `rally.toml` from the given path.
 pub fn load(path: &Path) -> Result<Config> {
+    load_with_telemetry(path, None)
+}
+
+/// Load and parse `rally.toml` from the given path and emit env provider lifecycle telemetry.
+pub fn load_with_telemetry(path: &Path, telemetry: Option<&TelemetrySink>) -> Result<Config> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     let config: Config = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-    interpolate_config(config)
+    resolve_config(
+        config,
+        path.parent(),
+        telemetry,
+        &std::env::vars().collect::<HashMap<_, _>>(),
+    )
 }
 
 /// Parse a config from a TOML string (used in tests).
 #[cfg(test)]
 pub fn parse(toml: &str) -> Result<Config> {
     let config = toml::from_str(toml)?;
-    interpolate_config(config)
+    resolve_config(config, None, None, &std::env::vars().collect::<HashMap<_, _>>())
 }
 
-fn interpolate_config(mut config: Config) -> Result<Config> {
-    let process_env: HashMap<String, String> = std::env::vars().collect();
-    let shared_env = resolve_env_map(&config.env, &process_env)
+fn resolve_config(
+    mut config: Config,
+    config_dir: Option<&Path>,
+    telemetry: Option<&TelemetrySink>,
+    process_env: &HashMap<String, String>,
+) -> Result<Config> {
+    let (base_env, provider_env, env_provider_info) = resolve_base_env(
+        config.env_command.as_ref(),
+        config_dir,
+        telemetry,
+        process_env,
+    )?;
+    config.env_provider_info = env_provider_info;
+
+    let shared_env = resolve_env_map(&config.env, &base_env)
         .with_context(|| "Failed to resolve shared env")?;
     config.env = shared_env.clone();
-    let mut shared_scope = process_env.clone();
+    let mut shared_scope = base_env.clone();
     shared_scope.extend(shared_env.clone());
 
     for app in &mut config.app {
         let resolved_env = resolve_env_map(&app.env, &shared_scope)
             .with_context(|| format!("Failed to resolve env for app {}", app.name))?;
-        let mut effective_env = shared_env.clone();
+        let mut effective_env = base_env.clone();
+        effective_env.extend(shared_env.clone());
         effective_env.extend(resolved_env.clone());
+        app.managed_env = build_managed_env(&effective_env, &provider_env, &shared_env, &resolved_env);
         app.env = effective_env.clone();
 
-        let mut app_scope = process_env.clone();
-        app_scope.extend(effective_env.clone());
+        let app_scope = effective_env.clone();
 
         app.name = interpolate_string(&app.name, &app_scope)
             .with_context(|| "Failed to resolve app name")?;
@@ -240,6 +311,453 @@ fn interpolate_config(mut config: Config) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+fn resolve_base_env(
+    env_command: Option<&EnvCommandConfig>,
+    config_dir: Option<&Path>,
+    telemetry: Option<&TelemetrySink>,
+    process_env: &HashMap<String, String>,
+) -> Result<(HashMap<String, String>, HashMap<String, String>, Option<EnvProviderInfo>)> {
+    let Some(env_command) = env_command else {
+        return Ok((process_env.clone(), HashMap::new(), None));
+    };
+
+    let (provider_env, info) = execute_env_command(env_command, config_dir, telemetry)?;
+
+    let mut base_env = if env_command.override_existing {
+        process_env.clone()
+    } else {
+        provider_env.clone()
+    };
+    if env_command.override_existing {
+        base_env.extend(provider_env.clone());
+    } else {
+        base_env.extend(process_env.clone());
+    }
+
+    Ok((base_env, provider_env, Some(info)))
+}
+
+fn build_managed_env(
+    effective_env: &HashMap<String, String>,
+    provider_env: &HashMap<String, String>,
+    shared_env: &HashMap<String, String>,
+    app_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut managed_env = HashMap::new();
+
+    for key in provider_env
+        .keys()
+        .chain(shared_env.keys())
+        .chain(app_env.keys())
+    {
+        if let Some(value) = effective_env.get(key) {
+            managed_env.insert(key.clone(), value.clone());
+        }
+    }
+
+    managed_env
+}
+
+fn execute_env_command(
+    env_command: &EnvCommandConfig,
+    config_dir: Option<&Path>,
+    telemetry: Option<&TelemetrySink>,
+) -> Result<(HashMap<String, String>, EnvProviderInfo)> {
+    let workdir = resolve_env_command_workdir(env_command, config_dir)?;
+    let command_for_spawn = resolve_env_command_path(&env_command.command, &workdir);
+    let command_display = format_command_display(&env_command.command, &env_command.args);
+    let started_at = Instant::now();
+
+    let mut child = Command::new(&command_for_spawn);
+    child
+        .args(&env_command.args)
+        .current_dir(&workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match child.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            emit_env_command_failed(
+                telemetry,
+                &command_display,
+                started_at.elapsed(),
+                true,
+                None,
+                &error.to_string(),
+            );
+            return Err(anyhow::anyhow!(
+                "env_command {} failed to start: {}",
+                command_display,
+                error
+            ));
+        }
+    };
+
+    let stdout_reader = child
+        .stdout
+        .take()
+        .context("env_command stdout pipe was not available")?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .context("env_command stderr pipe was not available")?;
+
+    let stdout_handle = thread::spawn(move || read_pipe(stdout_reader));
+    let stderr_handle = thread::spawn(move || read_pipe(stderr_reader));
+
+    let timeout = Duration::from_millis(env_command.timeout_ms);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = join_pipe(stderr_handle)?;
+            let _ = join_pipe(stdout_handle)?;
+            let stderr_summary = summarize_stderr(&stderr);
+            emit_env_command_failed(
+                telemetry,
+                &command_display,
+                started_at.elapsed(),
+                true,
+                None,
+                &stderr_summary,
+            );
+            return Err(anyhow::anyhow!(
+                "env_command {} timed out after {}ms{}",
+                command_display,
+                env_command.timeout_ms,
+                format_stderr_suffix(&stderr_summary),
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let stdout = join_pipe(stdout_handle)?;
+    let stderr = join_pipe(stderr_handle)?;
+    let stderr_summary = summarize_stderr(&stderr);
+
+    if !status.success() {
+        emit_env_command_failed(
+            telemetry,
+            &command_display,
+            started_at.elapsed(),
+            false,
+            Some(status.to_string()),
+            &stderr_summary,
+        );
+        return Err(anyhow::anyhow!(
+            "env_command {} exited with status {}{}",
+            command_display,
+            status,
+            format_stderr_suffix(&stderr_summary),
+        ));
+    }
+
+    let stdout = String::from_utf8(stdout).map_err(|error| {
+        emit_env_command_failed(
+            telemetry,
+            &command_display,
+            started_at.elapsed(),
+            false,
+            Some(status.to_string()),
+            &stderr_summary,
+        );
+        anyhow::anyhow!(
+            "env_command {} produced invalid UTF-8 on stdout: {}{}",
+            command_display,
+            error,
+            format_stderr_suffix(&stderr_summary),
+        )
+    })?;
+
+    let values = parse_env_command_output(env_command.format, &stdout)
+        .with_context(|| format!("Failed to parse env_command output from {}", command_display))?;
+    let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+    emit_env_command_loaded(telemetry, &command_display, duration_ms, values.len());
+
+    Ok((
+        values.clone(),
+        EnvProviderInfo {
+            status: "loaded".to_owned(),
+            command: command_display,
+            format: env_command.format,
+            override_existing: env_command.override_existing,
+            key_count: values.len(),
+            duration_ms,
+            loaded_at: Utc::now(),
+        },
+    ))
+}
+
+fn resolve_env_command_workdir(
+    env_command: &EnvCommandConfig,
+    config_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let base_dir = match config_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir().context("Failed to resolve current directory")?,
+    };
+
+    match env_command.workdir.as_deref() {
+        Some(workdir) => {
+            let workdir = PathBuf::from(workdir);
+            if workdir.is_absolute() {
+                Ok(workdir)
+            } else {
+                Ok(base_dir.join(workdir))
+            }
+        }
+        None => Ok(base_dir),
+    }
+}
+
+fn resolve_env_command_path(command: &str, workdir: &Path) -> PathBuf {
+    let path = PathBuf::from(command);
+    if path.is_relative() && path.components().count() > 1 {
+        workdir.join(path)
+    } else {
+        path
+    }
+}
+
+fn read_pipe<R>(mut reader: R) -> Result<Vec<u8>>
+where
+    R: Read,
+{
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn join_pipe(handle: thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("env_command output reader thread panicked")),
+    }
+}
+
+fn parse_env_command_output(
+    format: EnvCommandFormat,
+    output: &str,
+) -> Result<HashMap<String, String>> {
+    match format {
+        EnvCommandFormat::Json => parse_json_env_output(output),
+        EnvCommandFormat::Shell => parse_shell_env_output(output),
+    }
+}
+
+fn parse_json_env_output(output: &str) -> Result<HashMap<String, String>> {
+    struct StrictStringMap(HashMap<String, String>);
+
+    impl<'de> Deserialize<'de> for StrictStringMap {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_map(StrictStringMapVisitor)
+        }
+    }
+
+    struct StrictStringMapVisitor;
+
+    impl<'de> Visitor<'de> for StrictStringMapVisitor {
+        type Value = StrictStringMap;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object containing only string values")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut values = HashMap::new();
+            while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
+                if !is_valid_env_name(&key) {
+                    return Err(de::Error::custom(format!("Invalid env key {}", key)));
+                }
+                if values.contains_key(&key) {
+                    return Err(de::Error::custom(format!("Duplicate env key {}", key)));
+                }
+
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| de::Error::custom(format!("Value for {} must be a string", key)))?;
+                values.insert(key, value.to_owned());
+            }
+            Ok(StrictStringMap(values))
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(output);
+    let StrictStringMap(values) = StrictStringMap::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(values)
+}
+
+fn parse_shell_env_output(output: &str) -> Result<HashMap<String, String>> {
+    let mut values = HashMap::new();
+
+    for (line_index, line) in output.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let rest = trimmed.strip_prefix("export ").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid shell output line {}: expected export NAME=VALUE",
+                line_index + 1
+            )
+        })?;
+        let (name, raw_value) = rest.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid shell output line {}: expected export NAME=VALUE",
+                line_index + 1
+            )
+        })?;
+        if !is_valid_env_name(name) {
+            anyhow::bail!("Invalid env key {} on line {}", name, line_index + 1);
+        }
+        if values.contains_key(name) {
+            anyhow::bail!("Duplicate env key {}", name);
+        }
+
+        values.insert(name.to_owned(), parse_shell_value(raw_value.trim(), line_index + 1)?);
+    }
+
+    Ok(values)
+}
+
+fn parse_shell_value(raw: &str, line_number: usize) -> Result<String> {
+    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+        return Ok(raw[1..raw.len() - 1].to_owned());
+    }
+
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        let mut output = String::with_capacity(raw.len() - 2);
+        let mut chars = raw[1..raw.len() - 1].chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                let escaped = chars.next().ok_or_else(|| {
+                    anyhow::anyhow!("Invalid shell escape on line {}", line_number)
+                })?;
+                output.push(match escaped {
+                    '\\' => '\\',
+                    '"' => '"',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '$' => '$',
+                    other => other,
+                });
+            } else {
+                output.push(ch);
+            }
+        }
+        return Ok(output);
+    }
+
+    if raw.chars().any(char::is_whitespace) {
+        anyhow::bail!("Unquoted shell value on line {} cannot contain whitespace", line_number);
+    }
+
+    Ok(raw.to_owned())
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn format_command_display(command: &str, args: &[String]) -> String {
+    std::iter::once(command.to_owned())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_stderr(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut summary = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if summary.len() > 240 {
+        summary.truncate(240);
+        summary.push_str("...");
+    }
+    summary
+}
+
+fn format_stderr_suffix(stderr_summary: &str) -> String {
+    if stderr_summary.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {}", stderr_summary)
+    }
+}
+
+fn emit_env_command_loaded(
+    telemetry: Option<&TelemetrySink>,
+    command: &str,
+    duration_ms: u64,
+    key_count: usize,
+) {
+    if let Some(telemetry) = telemetry {
+        telemetry.emit(
+            "rally:lifecycle",
+            format!(
+                "env_command_loaded command={} duration_ms={} key_count={}",
+                command, duration_ms, key_count
+            ),
+        );
+    }
+}
+
+fn emit_env_command_failed(
+    telemetry: Option<&TelemetrySink>,
+    command: &str,
+    duration: Duration,
+    timed_out: bool,
+    exit_status: Option<String>,
+    stderr_summary: &str,
+) {
+    if let Some(telemetry) = telemetry {
+        let duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        let exit_status = exit_status.unwrap_or_else(|| "n/a".to_owned());
+        telemetry.emit(
+            "rally:lifecycle",
+            format!(
+                "env_command_failed command={} duration_ms={} timeout={} exit_status={} stderr={}",
+                command,
+                duration_ms,
+                timed_out,
+                exit_status,
+                if stderr_summary.is_empty() {
+                    "none"
+                } else {
+                    stderr_summary
+                }
+            ),
+        );
+    }
 }
 
 fn interpolate_hook(
@@ -361,6 +879,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn parse_with_process_env(toml: &str, process_env: HashMap<String, String>) -> Result<Config> {
+        let config = toml::from_str(toml)?;
+        resolve_config(config, None, None, &process_env)
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
     fn empty_config_is_valid() {
@@ -369,6 +902,8 @@ mod tests {
         assert!(cfg.app.is_empty());
         assert_eq!(cfg.ui.port, 7700);
         assert_eq!(cfg.ui.host, "127.0.0.1");
+        assert!(cfg.env_command.is_none());
+        assert!(cfg.env_provider_info.is_none());
     }
 
     #[test]
@@ -387,7 +922,7 @@ command = "/usr/bin/myapp"
         assert!(app.enabled);
         assert_eq!(app.command, "/usr/bin/myapp");
         assert!(app.args.is_empty());
-        assert!(app.env.is_empty());
+        assert_eq!(app.env, std::env::vars().collect::<HashMap<_, _>>());
         assert!(app.depends_on.is_empty());
         assert!(app.before.is_empty());
         assert!(app.after.is_empty());
@@ -619,5 +1154,165 @@ B = "${A}"
         let error = parse(toml).unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("ENV interpolation cycle detected"));
+    }
+
+    #[test]
+    fn env_command_json_parser_rejects_duplicate_keys() {
+        let error = parse_json_env_output(r#"{"A":"1","A":"2"}"#).unwrap_err();
+        assert!(error.to_string().contains("Duplicate env key A"));
+    }
+
+    #[test]
+    fn env_command_json_parser_rejects_non_string_values() {
+        let error = parse_json_env_output(r#"{"A":1}"#).unwrap_err();
+        assert!(error.to_string().contains("must be a string"));
+    }
+
+    #[test]
+    fn env_command_shell_parser_accepts_exports_and_comments() {
+        let env = parse_shell_env_output(
+            "# comment\nexport API_URL='http://127.0.0.1:8080'\nexport LOG_LEVEL=debug\n",
+        )
+        .unwrap();
+
+        assert_eq!(env["API_URL"], "http://127.0.0.1:8080");
+        assert_eq!(env["LOG_LEVEL"], "debug");
+    }
+
+    #[test]
+    fn env_command_provider_merges_before_shared_env_and_app_env() {
+        let toml = r#"
+[env]
+BASE_URL = "http://${HOST}:${PORT}"
+
+[[app]]
+name = "api"
+command = "api"
+
+[app.env]
+PORT = "8080"
+API_URL = "${BASE_URL}/v1"
+"#;
+
+        let mut process_env = HashMap::new();
+        process_env.insert("HOST".to_owned(), "127.0.0.1".to_owned());
+        process_env.insert("PORT".to_owned(), "9000".to_owned());
+
+        let cfg = parse_with_process_env(toml, process_env).unwrap();
+        let app = &cfg.app[0];
+
+        assert_eq!(cfg.env["BASE_URL"], "http://127.0.0.1:9000");
+        assert_eq!(app.env["PORT"], "8080");
+        assert_eq!(app.env["API_URL"], "http://127.0.0.1:9000/v1");
+    }
+
+    #[test]
+    fn env_command_override_existing_controls_base_precedence() {
+        let process_env = HashMap::from([
+            ("FROM_PROCESS".to_owned(), "process".to_owned()),
+            ("SHARED".to_owned(), "process".to_owned()),
+        ]);
+
+        let mut provider_env = HashMap::new();
+        provider_env.insert("SHARED".to_owned(), "provider".to_owned());
+        provider_env.insert("FROM_PROVIDER".to_owned(), "provider".to_owned());
+
+        let mut without_override = provider_env.clone();
+        without_override.extend(process_env.clone());
+        assert_eq!(without_override["SHARED"], "process");
+
+        let mut with_override = process_env;
+        with_override.extend(provider_env);
+        assert_eq!(with_override["SHARED"], "provider");
+        assert_eq!(with_override["FROM_PROCESS"], "process");
+        assert_eq!(with_override["FROM_PROVIDER"], "provider");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_executes_relative_env_command_from_config_directory() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rally-env-command-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let script_path = temp_dir.join("emit-env.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf '{\"RALLY_SAMPLE_HOST\":\"127.0.0.1\",\"RALLY_SAMPLE_PORT\":\"7811\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script_path);
+
+        let config_path = temp_dir.join("rally.toml");
+        fs::write(
+            &config_path,
+            r#"
+[env_command]
+command = "./emit-env.sh"
+format = "json"
+timeout_ms = 1000
+
+[env]
+RALLY_SAMPLE_ORIGIN = "http://${RALLY_SAMPLE_HOST}:${RALLY_SAMPLE_PORT}"
+
+[[app]]
+name = "sample"
+command = "sleep"
+args = ["1"]
+access = "${RALLY_SAMPLE_ORIGIN}/"
+
+[app.env]
+RALLY_SAMPLE_URL = "${RALLY_SAMPLE_ORIGIN}/ready"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load(&config_path).unwrap();
+        let app = &cfg.app[0];
+
+        assert_eq!(cfg.env_provider_info.as_ref().map(|info| info.key_count), Some(2));
+        assert_eq!(cfg.env["RALLY_SAMPLE_ORIGIN"], "http://127.0.0.1:7811");
+        assert_eq!(app.managed_env["RALLY_SAMPLE_HOST"], "127.0.0.1");
+        assert_eq!(app.managed_env["RALLY_SAMPLE_PORT"], "7811");
+        assert_eq!(app.managed_env["RALLY_SAMPLE_ORIGIN"], "http://127.0.0.1:7811");
+        assert_eq!(app.managed_env["RALLY_SAMPLE_URL"], "http://127.0.0.1:7811/ready");
+        assert_eq!(app.access.as_deref(), Some("http://127.0.0.1:7811/"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_fails_when_env_command_times_out() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rally-env-command-timeout-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let script_path = temp_dir.join("sleepy.sh");
+        fs::write(&script_path, "#!/bin/sh\nsleep 1\nprintf '{}'\n").unwrap();
+        make_executable(&script_path);
+
+        let config_path = temp_dir.join("rally.toml");
+        fs::write(
+            &config_path,
+            r#"
+[env_command]
+command = "./sleepy.sh"
+format = "json"
+timeout_ms = 10
+"#,
+        )
+        .unwrap();
+
+        let error = load(&config_path).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alexander R. Croft
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::{AppConfig, HookConfig};
+use crate::config::{AppConfig, EnvProviderInfo, HookConfig};
 use crate::sink::TelemetrySink;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -100,6 +100,8 @@ pub struct ProcessStatus {
     pub name: String,
     pub access: Option<String>,
     pub cargo: Option<String>,
+    pub env_provider: Option<EnvProviderInfo>,
+    pub managed_env: std::collections::HashMap<String, String>,
     pub enabled: bool,
     pub command: String,
     pub args: Vec<String>,
@@ -198,7 +200,7 @@ impl ManagedProcess {
     }
 
     /// Return a serialisable snapshot.
-    pub async fn status(&self) -> ProcessStatus {
+    pub async fn status(&self, env_provider: Option<&EnvProviderInfo>) -> ProcessStatus {
         let inner = self.inner.read().await;
         let watch_targets = collect_watch_targets(&self.config)
             .into_iter()
@@ -208,6 +210,8 @@ impl ManagedProcess {
             name: self.config.name.clone(),
             access: self.config.access.clone(),
             cargo: self.config.cargo.clone(),
+            env_provider: env_provider.cloned(),
+            managed_env: self.config.managed_env.clone(),
             enabled: inner.enabled,
             command: self.config.command.clone(),
             args: self.config.args.clone(),
@@ -780,13 +784,18 @@ pub struct ProcessManager {
     pub processes: Vec<Arc<Mutex<ManagedProcess>>>,
     start_order: Vec<usize>,
     index_by_name: HashMap<String, usize>,
+    env_provider: Option<EnvProviderInfo>,
     health_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     watch_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     telemetry: Arc<TelemetrySink>,
 }
 
 impl ProcessManager {
-    pub fn new(configs: Vec<AppConfig>, telemetry: Arc<TelemetrySink>) -> Result<Self> {
+    pub fn new(
+        configs: Vec<AppConfig>,
+        telemetry: Arc<TelemetrySink>,
+        env_provider: Option<EnvProviderInfo>,
+    ) -> Result<Self> {
         let start_order = resolve_start_order(&configs)?;
         let index_by_name = configs
             .iter()
@@ -801,6 +810,7 @@ impl ProcessManager {
             processes,
             start_order,
             index_by_name,
+            env_provider,
             health_tasks: std::sync::Mutex::new(Vec::new()),
             watch_tasks: std::sync::Mutex::new(Vec::new()),
             telemetry,
@@ -997,7 +1007,7 @@ impl ProcessManager {
         let mut out = Vec::with_capacity(self.processes.len());
         for proc in &self.processes {
             let p = proc.lock().await;
-            out.push(p.status().await);
+            out.push(p.status(self.env_provider.as_ref()).await);
         }
         out
     }
@@ -1317,6 +1327,7 @@ mod tests {
             workdir: None,
             args: Vec::new(),
             env: HashMap::new(),
+            managed_env: HashMap::new(),
             depends_on: depends_on.iter().map(|value| (*value).to_owned()).collect(),
             before: Vec::new(),
             after: Vec::new(),
@@ -1357,6 +1368,7 @@ mod tests {
         let manager = super::ProcessManager::new(
             vec![app("api", &[])],
             Arc::new(TelemetrySink::new(None)),
+            None,
         )
         .unwrap();
 
@@ -1401,6 +1413,7 @@ mod tests {
         let manager = super::ProcessManager::new(
             vec![disabled_app],
             Arc::new(TelemetrySink::new(None)),
+            None,
         )
         .unwrap();
 
@@ -1417,6 +1430,7 @@ mod tests {
         let manager = super::ProcessManager::new(
             vec![app("api", &[])],
             Arc::new(TelemetrySink::new(None)),
+            None,
         )
         .unwrap();
 
@@ -1439,6 +1453,7 @@ mod tests {
         let manager = super::ProcessManager::new(
             vec![disabled_app],
             Arc::new(TelemetrySink::new(None)),
+            None,
         )
         .unwrap();
 
