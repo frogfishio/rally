@@ -200,12 +200,20 @@ pub fn load_with_telemetry(path: &Path, telemetry: Option<&TelemetrySink>) -> Re
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     let config: Config = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    let config_dir = resolve_config_dir(path)?;
     resolve_config(
         config,
-        path.parent(),
+        Some(config_dir.as_path()),
         telemetry,
         &std::env::vars().collect::<HashMap<_, _>>(),
     )
+}
+
+fn resolve_config_dir(path: &Path) -> Result<PathBuf> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => Ok(parent.to_path_buf()),
+        _ => std::env::current_dir().context("Failed to resolve current directory"),
+    }
 }
 
 /// Parse a config from a TOML string (used in tests).
@@ -372,6 +380,8 @@ fn execute_env_command(
     let command_display = format_command_display(&env_command.command, &env_command.args);
     let started_at = Instant::now();
 
+    validate_env_command_workdir(&command_display, &workdir)?;
+
     let mut child = Command::new(&command_for_spawn);
     child
         .args(&env_command.args)
@@ -386,6 +396,7 @@ fn execute_env_command(
             let error_message = format_env_command_spawn_error(
                 &command_display,
                 env_command,
+                &workdir,
                 process_env,
                 &error,
             );
@@ -513,7 +524,7 @@ fn resolve_env_command_workdir(
 
     match env_command.workdir.as_deref() {
         Some(workdir) => {
-            let workdir = PathBuf::from(workdir);
+            let workdir = expand_home_path(workdir).unwrap_or_else(|| PathBuf::from(workdir));
             if workdir.is_absolute() {
                 Ok(workdir)
             } else {
@@ -525,7 +536,7 @@ fn resolve_env_command_workdir(
 }
 
 fn resolve_env_command_path(command: &str, workdir: &Path) -> PathBuf {
-    let path = PathBuf::from(command);
+    let path = expand_home_path(command).unwrap_or_else(|| PathBuf::from(command));
     if path.is_relative() && path.components().count() > 1 {
         workdir.join(path)
     } else {
@@ -533,9 +544,48 @@ fn resolve_env_command_path(command: &str, workdir: &Path) -> PathBuf {
     }
 }
 
+fn validate_env_command_workdir(command_display: &str, workdir: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(workdir).with_context(|| {
+        format!(
+            "env_command {} could not use workdir {}",
+            command_display,
+            workdir.display()
+        )
+    })?;
+
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "env_command {} workdir {} is not a directory",
+            command_display,
+            workdir.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn expand_home_path(path: &str) -> Option<PathBuf> {
+    let suffix = if path == "~" {
+        Some("")
+    } else {
+        path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
+    }?;
+
+    let home_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+
+    if suffix.is_empty() {
+        Some(home_dir)
+    } else {
+        Some(home_dir.join(suffix))
+    }
+}
+
 fn format_env_command_spawn_error(
     command_display: &str,
     env_command: &EnvCommandConfig,
+    workdir: &Path,
     process_env: &HashMap<String, String>,
     error: &std::io::Error,
 ) -> String {
@@ -545,8 +595,45 @@ fn format_env_command_spawn_error(
         return message;
     }
 
+    match std::fs::metadata(workdir) {
+        Ok(metadata) if !metadata.is_dir() => {
+            message.push_str(&format!(
+                ". Working directory {} is not a directory",
+                workdir.display()
+            ));
+            return message;
+        }
+        Err(metadata_error) if metadata_error.kind() == ErrorKind::NotFound => {
+            message.push_str(&format!(
+                ". Working directory {} does not exist",
+                workdir.display()
+            ));
+            return message;
+        }
+        Err(_) | Ok(_) => {}
+    }
+
+    let command_path = resolve_env_command_path(&env_command.command, workdir);
+    if command_path.is_absolute() || Path::new(&env_command.command).components().count() > 1 {
+        match std::fs::metadata(&command_path) {
+            Ok(_) => message.push_str(&format!(
+                ". Resolved command path {} exists, so the OS may be unable to locate its interpreter or executable loader; verify the file is executable and that any shebang/runtime dependency is installed",
+                command_path.display()
+            )),
+            Err(metadata_error) if metadata_error.kind() == ErrorKind::NotFound => {
+                message.push_str(&format!(
+                    ". Resolved command path {} does not exist",
+                    command_path.display()
+                ));
+            }
+            Err(_) => {}
+        }
+
+        return message;
+    }
+
     message.push_str(
-        ". env_command is executed directly without a shell, so shell-only PATH setup and ~ expansion do not apply",
+        ". env_command is executed directly without a shell, so shell-only PATH setup does not apply",
     );
 
     if let Some(path) = process_env.get("PATH") {
@@ -555,8 +642,7 @@ fn format_env_command_spawn_error(
         message.push_str(". PATH is unset");
     }
 
-    let command_path = Path::new(&env_command.command);
-    if command_path.components().count() == 1 {
+    if Path::new(&env_command.command).components().count() == 1 {
         message.push_str(
             ". If the binary lives outside Rally's PATH, set env_command.command to an absolute path",
         );
@@ -1280,6 +1366,7 @@ API_URL = "${BASE_URL}/v1"
         let message = format_env_command_spawn_error(
             "macrun env",
             &env_command,
+            Path::new("/tmp"),
             &process_env,
             &error,
         );
@@ -1287,6 +1374,140 @@ API_URL = "${BASE_URL}/v1"
         assert!(message.contains("without a shell"));
         assert!(message.contains("PATH=/usr/bin"));
         assert!(message.contains("absolute path"));
+    }
+
+    #[test]
+    fn resolve_env_command_path_expands_home_directory() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap();
+
+        let resolved = resolve_env_command_path("~/.cargo/bin/macrun", Path::new("/tmp"));
+
+        assert_eq!(resolved, PathBuf::from(home).join(".cargo/bin/macrun"));
+    }
+
+    #[test]
+    fn env_command_not_found_error_for_missing_absolute_path_reports_resolved_location() {
+        let missing = std::env::temp_dir().join(format!(
+            "rally-missing-env-command-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let env_command = EnvCommandConfig {
+            command: missing.display().to_string(),
+            args: vec!["env".to_owned()],
+            format: EnvCommandFormat::Shell,
+            timeout_ms: 5_000,
+            workdir: None,
+            override_existing: false,
+        };
+        let error = std::io::Error::from(ErrorKind::NotFound);
+
+        let message = format_env_command_spawn_error(
+            "missing env",
+            &env_command,
+            Path::new("/tmp"),
+            &HashMap::new(),
+            &error,
+        );
+
+        assert!(message.contains("does not exist"));
+        assert!(message.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn env_command_not_found_error_for_missing_workdir_reports_workdir() {
+        let env_command = EnvCommandConfig {
+            command: "/bin/echo".to_owned(),
+            args: vec!["env".to_owned()],
+            format: EnvCommandFormat::Shell,
+            timeout_ms: 5_000,
+            workdir: None,
+            override_existing: false,
+        };
+        let missing_workdir = std::env::temp_dir().join(format!(
+            "rally-missing-workdir-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let error = std::io::Error::from(ErrorKind::NotFound);
+
+        let message = format_env_command_spawn_error(
+            "echo env",
+            &env_command,
+            &missing_workdir,
+            &HashMap::new(),
+            &error,
+        );
+
+        assert!(message.contains("Working directory"));
+        assert!(message.contains("does not exist"));
+        assert!(message.contains(&missing_workdir.display().to_string()));
+    }
+
+    #[test]
+    fn validate_env_command_workdir_rejects_missing_directory() {
+        let missing_workdir = std::env::temp_dir().join(format!(
+            "rally-invalid-workdir-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let error = validate_env_command_workdir("macrun env", &missing_workdir).unwrap_err();
+
+        assert!(error.to_string().contains("could not use workdir"));
+        assert!(error.to_string().contains(&missing_workdir.display().to_string()));
+    }
+
+    #[test]
+    fn resolve_config_dir_uses_current_directory_for_bare_relative_path() {
+        let resolved = resolve_config_dir(Path::new("rally.toml")).unwrap();
+
+        assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn resolve_config_dir_preserves_non_empty_parent() {
+        let resolved = resolve_config_dir(Path::new("configs/rally.toml")).unwrap();
+
+        assert_eq!(resolved, PathBuf::from("configs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_command_not_found_error_for_existing_absolute_path_mentions_interpreter_or_loader() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rally-env-command-existing-path-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let script_path = temp_dir.join("emit-env.sh");
+        fs::write(&script_path, "#!/bin/sh\nprintf '{}'\n").unwrap();
+        make_executable(&script_path);
+
+        let env_command = EnvCommandConfig {
+            command: script_path.display().to_string(),
+            args: vec!["env".to_owned()],
+            format: EnvCommandFormat::Shell,
+            timeout_ms: 5_000,
+            workdir: None,
+            override_existing: false,
+        };
+        let error = std::io::Error::from(ErrorKind::NotFound);
+
+        let message = format_env_command_spawn_error(
+            "emit-env.sh env",
+            &env_command,
+            Path::new("/tmp"),
+            &HashMap::new(),
+            &error,
+        );
+
+        assert!(message.contains("interpreter or executable loader"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[cfg(unix)]

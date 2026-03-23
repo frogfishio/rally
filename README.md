@@ -231,7 +231,7 @@ Supported output formats:
 - `format = "json"` expects a single JSON object whose keys and values are all strings.
 - `format = "shell"` expects only `export NAME=VALUE` lines plus optional comments or blank lines.
 
-`env_command.command` is executed directly, not through a shell. Bare command names therefore depend on Rally's own `PATH`, and shell features such as `~` expansion do not apply. On macOS, tools installed under per-user locations such as `~/.cargo/bin` may require an absolute path like `/Users/alice/.cargo/bin/macrun` unless Rally is launched from a shell session that already exports that directory in `PATH`.
+`env_command.command` is executed directly, not through a shell. Bare command names therefore depend on Rally's own `PATH`, and shell-only features such as aliases or command substitution do not apply. Rally expands a leading `~/` (or `~`) against `HOME`/`USERPROFILE`, so per-user tool locations like `~/.cargo/bin/macrun` work without a wrapper shell.
 
 Provider stdout is treated as configuration payload. Rally does not forward it to app logs, the dashboard log panes, or optional ratatouille sinks.
 
