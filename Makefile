@@ -37,6 +37,21 @@ bump:
 	echo "Cargo.toml package version -> $$new_version"
 
 dist:
+	@version="$$(cat VERSION)"; \
+	case "$$version" in \
+	  ''|*[!0-9.]*) \
+	    echo "VERSION must contain only digits and dots" >&2; \
+	    exit 1; \
+	    ;; \
+	esac; \
+	awk -v version="$$version" 'BEGIN { in_package = 0; updated = 0 } \
+	  /^\[package\][[:space:]]*$$/ { in_package = 1; print; next } \
+	  /^\[/ && $$0 !~ /^\[package\][[:space:]]*$$/ { in_package = 0 } \
+	  in_package && /^version[[:space:]]*=/ && !updated { print "version = \"" version "\""; updated = 1; next } \
+	  { print } \
+	  END { if (!updated) exit 1 }' Cargo.toml > Cargo.toml.tmp; \
+	mv Cargo.toml.tmp Cargo.toml; \
+	echo "Cargo.toml package version -> $$version"
 	@current_build="$$(cat BUILD)"; \
 	case "$$current_build" in \
 	  ''|*[!0-9]*) \

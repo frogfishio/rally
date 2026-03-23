@@ -78,8 +78,9 @@ For local release helpers:
 # Increment the patch component in VERSION and sync Cargo.toml package version
 make bump
 
-# Increment BUILD, run a release build, copy the binary to dist/<os>-<arch>/bin,
-# and package the user guide, README, LICENSE, and example config into dist/<os>-<arch>/
+# Sync Cargo.toml to VERSION, increment BUILD, run a release build, copy the binary to
+# dist/<os>-<arch>/bin, and package the user guide, README, LICENSE, and example config
+# into dist/<os>-<arch>/
 make dist
 
 # Delete Cargo build artifacts under target/
