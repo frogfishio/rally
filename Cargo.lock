@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "frogfish-rally"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -329,6 +329,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "urlencoding",

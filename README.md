@@ -234,12 +234,41 @@ Rally can reload configuration in place through the dashboard or `POST /api/relo
 
 When `--sink` is configured, Rally emits its own lifecycle and process events plus managed app stdout and stderr to a ratatouille-compatible HTTP sink in NDJSON format. If the sink is absent or unreachable, Rally continues running and simply drops that outbound telemetry.
 
+If the sink endpoint is itself one of the apps managed by Rally, this still works, but delivery is best-effort: events emitted before that sink app is listening, or while it is restarting, are dropped rather than queued.
+
 Sink topics currently use this shape:
 
 - `rally:lifecycle` for startup, shutdown, and reload messages
 - `rally:process` for process lifecycle and restart messages
 - `rally:watch` for watcher setup and file-change messages
 - `rally:stdout` and `rally:stderr` for forwarded app output
+- `rally:output` for forwarded hook output and nonstandard stream names such as install output
+
+Example: managing a local sink app with Rally itself:
+
+```toml
+[[app]]
+name = "ratatouille-sink"
+command = "ratatouille"
+args = ["serve", "--listen", "127.0.0.1:9100"]
+access = "http://127.0.0.1:9100/"
+
+[[app]]
+name = "api"
+command = "cargo"
+args = ["run", "-p", "my-api"]
+depends_on = ["ratatouille-sink"]
+health_url = "http://127.0.0.1:8080/health"
+access = "http://127.0.0.1:8080/"
+```
+
+Then start Rally with the sink URL pointing at the managed sink app:
+
+```sh
+rally --sink http://127.0.0.1:9100/ingest
+```
+
+`depends_on` helps bring the sink app up first, but sink delivery is still best-effort. Any events emitted before the sink app is actually listening, or while it is restarting, are dropped.
 
 ## Watching and Restart Behavior
 

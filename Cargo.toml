@@ -3,7 +3,7 @@
 
 [package]
 name = "frogfish-rally"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Rally your services with an embedded development dashboard"
@@ -47,3 +47,6 @@ ratatouille = "0.1.0"
 notify = "8.0"
 clap = { version = "4.5", features = ["derive"] }
 urlencoding = "2.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -6,9 +6,7 @@ use crate::process_manager::{ControlResult, SharedManager};
 use crate::sink::TelemetrySink;
 use crate::ui::dashboard_html;
 use axum::{
-    body::{to_bytes, Body},
     extract::{Path, State},
-    http::Request,
     http::StatusCode,
     response::{Html, IntoResponse, Sse},
     routing::{get, post},
@@ -21,10 +19,12 @@ use std::sync::Arc;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::{RwLock, watch};
-use tokio_stream::StreamExt;
 
 #[cfg(test)]
-use tower::ServiceExt;
+use axum::{body::{to_bytes, Body}, http::Request};
+
+#[cfg(test)]
+use tower::util::ServiceExt;
 
 pub struct AppState {
     config_path: PathBuf,

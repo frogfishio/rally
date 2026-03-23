@@ -604,19 +604,23 @@ async fn run_single_hook(
 
     if let Some(stdout) = child.stdout.take() {
         capture_hook_output(
+            app_name.to_owned(),
             inner_arc.clone(),
             change_tx.clone(),
             format!("{}:stdout", phase),
             stdout,
+            telemetry.clone(),
         );
     }
 
     if let Some(stderr) = child.stderr.take() {
         capture_hook_output(
+            app_name.to_owned(),
             inner_arc.clone(),
             change_tx.clone(),
             format!("{}:stderr", phase),
             stderr,
+            telemetry.clone(),
         );
     }
 
@@ -630,17 +634,14 @@ async fn run_single_hook(
 }
 
 fn capture_hook_output(
+    app_name: String,
     inner_arc: Arc<RwLock<Inner>>,
     change_tx: broadcast::Sender<()>,
     stream: String,
     pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    telemetry: Arc<TelemetrySink>,
 ) {
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(pipe).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            push_process_log(&inner_arc, &change_tx, &stream, line).await;
-        }
-    });
+    capture_named_output(app_name, stream, pipe, inner_arc, change_tx, telemetry);
 }
 
 fn capture_named_output(
@@ -1312,10 +1313,16 @@ fn resolve_start_order(configs: &[AppConfig]) -> Result<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{collect_watch_targets, resolve_start_order};
-    use crate::config::{AppConfig, WatchConfig};
+    use crate::config::{AppConfig, HookConfig, WatchConfig};
     use crate::sink::TelemetrySink;
+    use axum::{Router, extract::State, routing::post};
     use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
     use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn app(name: &str, depends_on: &[&str]) -> AppConfig {
         AppConfig {
@@ -1337,6 +1344,44 @@ mod tests {
             restart_on_exit: false,
             log_lines: 500,
         }
+    }
+
+    async fn collect_sink_payloads() -> (String, Arc<StdMutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        async fn ingest(
+            State(payloads): State<Arc<StdMutex<Vec<String>>>>,
+            body: String,
+        ) -> &'static str {
+            payloads.lock().unwrap().push(body);
+            "ok"
+        }
+
+        let payloads = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route("/ingest", post(ingest))
+            .with_state(payloads.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{}/ingest", addr), payloads, handle)
+    }
+
+    async fn wait_for_payload(
+        payloads: &Arc<StdMutex<Vec<String>>>,
+        needle: &str,
+    ) -> bool {
+        for _ in 0..40 {
+            {
+                let joined = payloads.lock().unwrap().join("\n");
+                if joined.contains(needle) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
     }
 
     #[test]
@@ -1459,6 +1504,63 @@ mod tests {
 
         let result = manager.restart_by_name("api", "manual restart").await;
         assert_eq!(result, super::ControlResult::Disabled);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forwards_process_and_hook_output_to_sink() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "rally-sink-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let hook_script_path = temp_root.join("hook.sh");
+        let app_script_path = temp_root.join("app.sh");
+        std::fs::write(
+            &hook_script_path,
+            "#!/bin/sh\necho hook-out\necho hook-err 1>&2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &app_script_path,
+            "#!/bin/sh\necho app-out\necho app-err 1>&2\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook_script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook_script_path, permissions.clone()).unwrap();
+        std::fs::set_permissions(&app_script_path, permissions).unwrap();
+
+        let (sink_url, payloads, server_handle) = collect_sink_payloads().await;
+
+        let mut configured_app = app("api", &[]);
+        configured_app.command = app_script_path.display().to_string();
+        configured_app.before = vec![HookConfig {
+            command: hook_script_path.display().to_string(),
+            args: Vec::new(),
+            workdir: None,
+            env: HashMap::new(),
+        }];
+
+        let manager = super::ProcessManager::new(
+            vec![configured_app],
+            Arc::new(TelemetrySink::new(Some(sink_url))),
+            None,
+        )
+        .unwrap();
+
+        manager.start_all().await;
+
+        assert!(wait_for_payload(&payloads, "app=api app-out").await);
+        assert!(wait_for_payload(&payloads, "app=api app-err").await);
+        assert!(wait_for_payload(&payloads, "app=api hook-out").await);
+        assert!(wait_for_payload(&payloads, "app=api hook-err").await);
+
+        server_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }
 
