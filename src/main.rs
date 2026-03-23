@@ -21,14 +21,15 @@ const DISPLAY_VERSION: &str = env!("RALLY_DISPLAY_VERSION");
 const LICENSE_SUMMARY: &str = "Copyright (C) 2026 Alexander R. Croft\nLicense: GPL-3.0-or-later\n";
 const DEFAULT_CONFIG_PATH: &str = "rally.toml";
 const CONFIG_ENV_VAR: &str = "RALLY_CONFIG";
+const SINK_ENV_VAR: &str = "RALLY_SINK";
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(
     name = "rally",
     version = DISPLAY_VERSION,
     about = "Rally your services with a local process dashboard",
-    long_about = "Rally launches and supervises multiple local development processes, serves an embedded dashboard, and can optionally forward lifecycle and process output events to a ratatouille sink. Config path precedence is: --config, legacy positional path, RALLY_CONFIG, then ./rally.toml.",
-    after_help = "Examples:\n  rally\n  RALLY_CONFIG=./dev.rally.toml rally\n  rally --config ./rally.toml\n  rally --sink http://127.0.0.1:9100/ingest\n  rally ./custom-rally.toml\n  rally start api-server\n  rally stop api-server\n  rally enable worker"
+    long_about = "Rally launches and supervises multiple local development processes, serves an embedded dashboard, and can optionally forward lifecycle and process output events to a ratatouille sink. Config path precedence is: --config, legacy positional path, RALLY_CONFIG, then ./rally.toml. Sink precedence is: --sink, RALLY_SINK.",
+    after_help = "Examples:\n  rally\n  RALLY_CONFIG=./dev.rally.toml rally\n  rally --config ./rally.toml\n  RALLY_SINK=http://127.0.0.1:9100/ingest rally\n  rally --sink http://127.0.0.1:9100/ingest\n  rally ./custom-rally.toml\n  rally start api-server\n  rally stop api-server\n  rally enable worker"
 )]
 struct CliArgs {
     #[arg(
@@ -47,7 +48,7 @@ struct CliArgs {
     )]
     config_path_positional: Option<PathBuf>,
 
-    #[arg(long = "sink", value_name = "URL", help = "Optional ratatouille HTTP sink URL")]
+    #[arg(long = "sink", value_name = "URL", help = "Optional ratatouille HTTP sink URL (overrides RALLY_SINK)")]
     sink_url: Option<String>,
 
     #[arg(long = "license", help = "Print copyright and license summary")]
@@ -134,7 +135,7 @@ where
         return Ok(CliAction::Print(format_license_text()));
     }
 
-    let config_path = resolve_config_path(&args, env_lookup);
+    let config_path = resolve_config_path(&args, &env_lookup);
 
     if let Some(command) = args.command {
         let (command, app_name) = match command {
@@ -154,7 +155,7 @@ where
 
     Ok(CliAction::Run(CliOptions {
         config_path,
-        sink_url: args.sink_url,
+        sink_url: resolve_sink_url(&args, &env_lookup),
     }))
 }
 
@@ -167,6 +168,15 @@ where
         .or(args.config_path_positional.clone())
         .or_else(|| env_lookup(OsStr::new(CONFIG_ENV_VAR)).map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
+
+fn resolve_sink_url<F>(args: &CliArgs, env_lookup: F) -> Option<String>
+where
+    F: Fn(&OsStr) -> Option<OsString>,
+{
+    args.sink_url.clone().or_else(|| {
+        env_lookup(OsStr::new(SINK_ENV_VAR)).map(|value| value.to_string_lossy().into_owned())
+    })
 }
 
 fn format_license_text() -> String {
@@ -334,10 +344,8 @@ async fn main() -> Result<()> {
         .await
         .context("Web server error")?;
 
-    // Kill remaining child processes
+    // Ensure remaining managed jobs are stopped before exit.
     state.shutdown().await;
-    // Brief pause so children can flush
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     Ok(())
 }
@@ -347,7 +355,7 @@ mod tests {
     use super::{
         CliAction, CliArgs, CONFIG_ENV_VAR, ControlCommand, DEFAULT_CONFIG_PATH,
         DISPLAY_VERSION, format_license_text, parse_cli_args_from,
-        parse_cli_args_from_with_env,
+        parse_cli_args_from_with_env, SINK_ENV_VAR,
     };
     use anyhow::anyhow;
     use clap::CommandFactory;
@@ -355,18 +363,21 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse_from(args: &[&str]) -> anyhow::Result<super::CliOptions> {
-        parse_from_with_env(args, None)
+        parse_from_with_env(args, None, None)
     }
 
     fn parse_from_with_env(
         args: &[&str],
         env_config: Option<&str>,
+        env_sink: Option<&str>,
     ) -> anyhow::Result<super::CliOptions> {
         let mut argv = vec!["rally"];
         argv.extend_from_slice(args);
         match parse_cli_args_from_with_env(argv, |key| {
             if key == OsStr::new(CONFIG_ENV_VAR) {
                 env_config.map(OsString::from)
+            } else if key == OsStr::new(SINK_ENV_VAR) {
+                env_sink.map(OsString::from)
             } else {
                 None
             }
@@ -392,20 +403,37 @@ mod tests {
 
     #[test]
     fn uses_rally_config_env_when_no_cli_path_is_provided() {
-        let cli = parse_from_with_env(&[], Some("env-rally.toml")).unwrap();
+        let cli = parse_from_with_env(&[], Some("env-rally.toml"), None).unwrap();
         assert_eq!(cli.config_path, PathBuf::from("env-rally.toml"));
     }
 
     #[test]
     fn explicit_config_flag_overrides_rally_config_env() {
-        let cli = parse_from_with_env(&["--config", "custom.toml"], Some("env-rally.toml")).unwrap();
+        let cli = parse_from_with_env(&["--config", "custom.toml"], Some("env-rally.toml"), None).unwrap();
         assert_eq!(cli.config_path, PathBuf::from("custom.toml"));
     }
 
     #[test]
     fn positional_config_overrides_rally_config_env() {
-        let cli = parse_from_with_env(&["custom.toml"], Some("env-rally.toml")).unwrap();
+        let cli = parse_from_with_env(&["custom.toml"], Some("env-rally.toml"), None).unwrap();
         assert_eq!(cli.config_path, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn uses_rally_sink_env_when_no_cli_sink_is_provided() {
+        let cli = parse_from_with_env(&[], None, Some("http://127.0.0.1:9100/ingest")).unwrap();
+        assert_eq!(cli.sink_url.as_deref(), Some("http://127.0.0.1:9100/ingest"));
+    }
+
+    #[test]
+    fn explicit_sink_flag_overrides_rally_sink_env() {
+        let cli = parse_from_with_env(
+            &["--sink", "http://127.0.0.1:9200/ingest"],
+            None,
+            Some("http://127.0.0.1:9100/ingest"),
+        )
+        .unwrap();
+        assert_eq!(cli.sink_url.as_deref(), Some("http://127.0.0.1:9200/ingest"));
     }
 
     #[test]
@@ -428,6 +456,8 @@ mod tests {
         let action = parse_cli_args_from_with_env(argv, |key| {
             if key == OsStr::new(CONFIG_ENV_VAR) {
                 Some(OsString::from("env-rally.toml"))
+            } else if key == OsStr::new(SINK_ENV_VAR) {
+                None
             } else {
                 None
             }
@@ -479,6 +509,7 @@ mod tests {
         assert!(help.contains("--license"));
         assert!(help.contains("--sink"));
         assert!(help.contains(CONFIG_ENV_VAR));
+        assert!(help.contains(SINK_ENV_VAR));
         assert!(help.contains("start"));
         assert!(help.contains("enable"));
         assert!(help.contains("Examples:"));

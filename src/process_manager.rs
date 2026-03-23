@@ -56,6 +56,8 @@ pub enum ProcessState {
     Exited(i32),
     /// Process was killed by a signal.
     Killed,
+    /// App appears to already be running outside Rally.
+    External,
     /// Process failed to start.
     Failed,
 }
@@ -69,6 +71,7 @@ impl std::fmt::Display for ProcessState {
             ProcessState::Running => write!(f, "running"),
             ProcessState::Exited(code) => write!(f, "exited({})", code),
             ProcessState::Killed => write!(f, "killed"),
+            ProcessState::External => write!(f, "external"),
             ProcessState::Failed => write!(f, "failed"),
         }
     }
@@ -113,6 +116,7 @@ pub struct ProcessStatus {
     pub exit_time: Option<DateTime<Utc>>,
     pub restart_count: u32,
     pub last_restart_reason: Option<String>,
+    pub last_error: Option<String>,
     pub watch_enabled: bool,
     pub watch_paths: Vec<String>,
     pub watch_debounce_millis: Option<u64>,
@@ -129,6 +133,7 @@ pub(crate) struct Inner {
     exit_time: Option<DateTime<Utc>>,
     restart_count: u32,
     last_restart_reason: Option<String>,
+    last_error: Option<String>,
     logs: VecDeque<LogLine>,
     pub(crate) max_log_lines: usize,
     supervisor_active: bool,
@@ -165,6 +170,76 @@ fn initial_process_state(config: &AppConfig) -> ProcessState {
     }
 }
 
+async fn detect_external_running(config: &AppConfig) -> Option<String> {
+    if let Some(url) = config.health_url.as_ref() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(750))
+            .build()
+            .ok()?;
+
+        if let Ok(response) = client.get(url).send().await {
+            if response.status().is_success() {
+                return Some(format!(
+                    "Health endpoint {} was already reachable before launch; {} may already be running outside Rally",
+                    url, config.name
+                ));
+            }
+        }
+    }
+
+    let (host, port, source) = local_probe_target(config)?;
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Some(format!(
+            "Local port {} on {} from {} was already accepting connections before launch; {} may already be running outside Rally",
+            port, host, source, config.name
+        )),
+        _ => None,
+    }
+}
+
+fn local_probe_target(config: &AppConfig) -> Option<(String, u16, &'static str)> {
+    if let Some(url) = config.health_url.as_ref() {
+        if let Some((host, port)) = parse_local_url_host_port(url) {
+            return Some((host, port, "health_url"));
+        }
+    }
+
+    let access = config.access.as_ref()?;
+    let (host, port) = parse_local_url_host_port(access)?;
+    Some((host, port, "access"))
+}
+
+fn parse_local_url_host_port(value: &str) -> Option<(String, u16)> {
+    let url = reqwest::Url::parse(value).ok()?;
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let connect_host = match host {
+        "127.0.0.1" | "localhost" => "127.0.0.1",
+        "::1" => "::1",
+        "0.0.0.0" => "127.0.0.1",
+        _ => return None,
+    };
+
+    Some((connect_host.to_owned(), port))
+}
+
+async fn terminate_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Rally places managed apps in their own process group, so terminate the group.
+        unsafe {
+            libc::killpg(pid as i32, libc::SIGKILL);
+        }
+    }
+
+    let _ = child.kill().await;
+}
+
 /// A single managed process.
 pub struct ManagedProcess {
     pub config: AppConfig,
@@ -186,6 +261,7 @@ impl ManagedProcess {
             exit_time: None,
             restart_count: 0,
             last_restart_reason: None,
+            last_error: None,
             logs: VecDeque::new(),
             max_log_lines: config.log_lines,
             supervisor_active: false,
@@ -223,6 +299,7 @@ impl ManagedProcess {
             exit_time: inner.exit_time,
             restart_count: inner.restart_count,
             last_restart_reason: inner.last_restart_reason.clone(),
+            last_error: inner.last_error.clone(),
             watch_enabled: !watch_targets.is_empty(),
             watch_paths: watch_targets,
             watch_debounce_millis: self.config.watch.as_ref().map(|watch| watch.debounce_millis),
@@ -302,6 +379,22 @@ impl ManagedProcess {
         tokio::spawn(async move {
             let mut install_attempted = false;
             loop {
+                if let Some(reason) = detect_external_running(&config).await {
+                    warn!(name = %config.name, reason = %reason, "App appears already reachable before launch");
+                    telemetry.emit(
+                        "rally:process",
+                        format!("{} appears already running externally: {}", config.name, reason),
+                    );
+                    let mut inner = inner_arc.write().await;
+                    inner.state = ProcessState::External;
+                    inner.health = HealthStatus::Healthy;
+                    inner.exit_time = Some(Utc::now());
+                    inner.last_error = Some(reason.clone());
+                    inner.push_log("stderr", reason);
+                    let _ = change_tx.send(());
+                    break;
+                }
+
                 if let Err(error) = run_hooks(
                     &config.name,
                     &config.before,
@@ -321,6 +414,7 @@ impl ManagedProcess {
                     let mut inner = inner_arc.write().await;
                     inner.state = ProcessState::Failed;
                     inner.exit_time = Some(Utc::now());
+                    inner.last_error = Some(format!("Before hook failed: {}", error));
                     inner.push_log("stderr", format!("Before hook failed: {}", error));
                     let _ = change_tx.send(());
                     break;
@@ -359,6 +453,7 @@ impl ManagedProcess {
                                     let mut inner = inner_arc.write().await;
                                     inner.state = ProcessState::Failed;
                                     inner.exit_time = Some(Utc::now());
+                                    inner.last_error = Some(format!("Cargo install failed: {}", error));
                                     inner.push_log("stderr", format!("Cargo install failed: {}", error));
                                     let _ = change_tx.send(());
                                     break;
@@ -373,6 +468,7 @@ impl ManagedProcess {
                         );
                         let mut inner = inner_arc.write().await;
                         inner.state = ProcessState::Failed;
+                        inner.last_error = Some(format!("Failed to spawn: {}", e));
                         inner.push_log("stderr", format!("Failed to spawn: {}", e));
                         let _ = change_tx.send(());
                         break;
@@ -392,6 +488,7 @@ impl ManagedProcess {
                             inner.pid = pid;
                             inner.started_at = Some(Utc::now());
                             inner.exit_time = None;
+                            inner.last_error = None;
                             inner.kill_tx = Some(kill_tx);
                             let _ = change_tx.send(());
                         }
@@ -424,7 +521,7 @@ impl ManagedProcess {
                         let exit_status = tokio::select! {
                             status = child.wait() => status,
                             _ = kill_rx => {
-                                let _ = child.kill().await;
+                                terminate_child(&mut child).await;
                                 child.wait().await
                             }
                         };
@@ -452,6 +549,7 @@ impl ManagedProcess {
                                     "rally:process",
                                     format!("{} exited code={}", config.name, code),
                                 );
+                                inner.last_error = (code != 0).then(|| format!("Process exited with code {}", code));
                                 inner.push_log(
                                     "stderr",
                                     format!("Process exited with code {}", code),
@@ -471,6 +569,7 @@ impl ManagedProcess {
                                     "rally:process",
                                     format!("{} wait error: {}", config.name, e),
                                 );
+                                inner.last_error = Some(format!("Process wait error: {}", e));
                                 inner.push_log("stderr", format!("Process wait error: {}", e));
                             }
                         }
@@ -493,6 +592,7 @@ impl ManagedProcess {
                                 format!("after hook failed for {}: {}", config.name, error),
                             );
                             let mut inner = inner_arc.write().await;
+                            inner.last_error = Some(format!("After hook failed: {}", error));
                             inner.push_log("stderr", format!("After hook failed: {}", error));
                             let _ = change_tx.send(());
                         }
@@ -833,6 +933,16 @@ impl ProcessManager {
         for index in self.start_order.iter().rev() {
             let p = self.processes[*index].lock().await;
             p.kill().await;
+        }
+    }
+
+    /// Kill all running processes and wait for their supervisors to stop.
+    pub async fn shutdown_all(&self) {
+        self.kill_all().await;
+
+        for index in self.start_order.iter().rev() {
+            let proc = self.processes[*index].clone();
+            self.wait_for_shutdown(&proc).await;
         }
     }
 
@@ -1315,7 +1425,7 @@ mod tests {
     use super::{collect_watch_targets, resolve_start_order};
     use crate::config::{AppConfig, HookConfig, WatchConfig};
     use crate::sink::TelemetrySink;
-    use axum::{Router, extract::State, routing::post};
+    use axum::{Router, extract::State, routing::{get, post}};
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::Arc;
@@ -1366,6 +1476,21 @@ mod tests {
         });
 
         (format!("http://{}/ingest", addr), payloads, handle)
+    }
+
+    async fn serve_health_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+        async fn healthy() -> &'static str {
+            "ok"
+        }
+
+        let app = Router::new().route("/health", get(healthy));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{}/health", addr), handle)
     }
 
     async fn wait_for_payload(
@@ -1508,6 +1633,41 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shutdown_all_waits_for_running_processes_to_stop() {
+        let mut configured_app = app("api", &[]);
+        configured_app.command = "sh".to_owned();
+        configured_app.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+
+        let manager = super::ProcessManager::new(
+            vec![configured_app],
+            Arc::new(TelemetrySink::new(None)),
+            None,
+        )
+        .unwrap();
+
+        manager.start_all().await;
+
+        for _ in 0..20 {
+            let statuses = manager.all_statuses().await;
+            if statuses[0].state == super::ProcessState::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        manager.shutdown_all().await;
+
+        let statuses = manager.all_statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_ne!(statuses[0].state, super::ProcessState::Running);
+
+        let proc = manager.processes[0].lock().await;
+        assert!(!proc.is_supervisor_active().await);
+        assert_eq!(proc.status(None).await.pid, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn forwards_process_and_hook_output_to_sink() {
         let temp_root = std::env::temp_dir().join(format!(
             "rally-sink-test-{}-{}",
@@ -1561,6 +1721,72 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn detects_when_health_endpoint_is_already_running_externally() {
+        let (health_url, health_handle) = serve_health_endpoint().await;
+
+        let mut configured_app = app("api", &[]);
+        configured_app.command = "sleep".to_owned();
+        configured_app.args = vec!["5".to_owned()];
+        configured_app.health_url = Some(health_url.clone());
+
+        let manager = super::ProcessManager::new(
+            vec![configured_app],
+            Arc::new(TelemetrySink::new(None)),
+            None,
+        )
+        .unwrap();
+
+        manager.start_all().await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let statuses = manager.all_statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, super::ProcessState::External);
+        assert_eq!(statuses[0].health, super::HealthStatus::Healthy);
+        assert_eq!(statuses[0].pid, None);
+        assert!(statuses[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already be running outside Rally"));
+
+        health_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn detects_when_local_access_port_is_already_taken() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut configured_app = app("frontend", &[]);
+        configured_app.command = "sleep".to_owned();
+        configured_app.args = vec!["5".to_owned()];
+        configured_app.access = Some(format!("http://127.0.0.1:{}/", addr.port()));
+
+        let manager = super::ProcessManager::new(
+            vec![configured_app],
+            Arc::new(TelemetrySink::new(None)),
+            None,
+        )
+        .unwrap();
+
+        manager.start_all().await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let statuses = manager.all_statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, super::ProcessState::External);
+        assert_eq!(statuses[0].pid, None);
+        assert!(statuses[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already accepting connections before launch"));
+
+        drop(listener);
     }
 }
 

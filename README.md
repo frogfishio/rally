@@ -38,6 +38,7 @@ Recent changes to Rally include:
 - **Remote control commands** — `start`, `stop`, `restart`, `enable`, and `disable` connect to an already-running Rally instance instead of starting a new one.
 - **Embedded web UI** at `http://127.0.0.1:7700` (configurable) — no external tools needed.
 - **Live dashboard** — real-time process state, uptime, PID, restart count, health badge.
+- **External process detection** — apps can show `external` when Rally detects the expected local listener is already up before launch, which usually means the app is already running outside Rally.
 - **Install visibility** — apps show `installing` while Rally runs `cargo install` for a missing command.
 - **Operational visibility** — the dashboard `Info` tab shows access details, enabled state, watch status, normalized watch paths, and the last restart reason for each app.
 - **Effective env view** — the dashboard `Env` tab shows the final environment Rally will run for each app after inherited env, optional env provider, shared env, and app-specific env merge, with a managed-only filter to hide ambient inherited variables by default.
@@ -147,6 +148,9 @@ rally /path/to/my/rally.toml
 # Or forward Rally lifecycle events to an optional HTTP sink
 rally --sink http://127.0.0.1:9100/ingest
 
+# Or select the sink through the environment
+RALLY_SINK=http://127.0.0.1:9100/ingest rally
+
 # Or control an existing Rally instance for one app
 rally restart api-server
 rally disable worker
@@ -176,12 +180,18 @@ Rally's command line is intentionally small and explicit:
 - `rally restart APP` asks an existing Rally instance to restart one app.
 - `rally enable APP` marks one app enabled at runtime.
 - `rally disable APP` marks one app disabled at runtime.
+- `RALLY_SINK=http://127.0.0.1:9100/ingest rally` selects the optional sink through the environment.
 - `rally --sink http://127.0.0.1:9100/ingest` enables best-effort ratatouille forwarding.
 - `rally --help` prints the full command reference.
 - `rally --version` prints the build version in `VERSION+build.BUILD` form.
 - `rally --license` prints the copyright and license summary.
 
 The sink is optional by design. If it is not reachable yet, Rally still starts, supervises processes, and simply drops outbound sink messages until delivery is possible.
+
+Sink URL precedence is deterministic:
+
+1. `--sink URL`
+2. `RALLY_SINK`
 
 Config path precedence is deterministic:
 
@@ -231,6 +241,8 @@ Rally can reload configuration in place through the dashboard or `POST /api/relo
 `depends_on` is enforced for both startup and shutdown. Dependencies start first, dependents stop first, and invalid dependency graphs are rejected before processes are launched.
 
 `before` hooks run in order and must succeed before Rally starts the app. `after` hooks run in order after the app exits or is stopped. Hook environment inherits the app `env` and can add or override values with `before.env` or `after.env`.
+
+Rally can also surface an `external` process state. This means Rally detected that the configured local listener was already reachable before it attempted launch, typically because that app is already running outside Rally. This detection currently uses `health_url` first, then local `access` URLs when available.
 
 When `--sink` is configured, Rally emits its own lifecycle and process events plus managed app stdout and stderr to a ratatouille-compatible HTTP sink in NDJSON format. If the sink is absent or unreachable, Rally continues running and simply drops that outbound telemetry.
 

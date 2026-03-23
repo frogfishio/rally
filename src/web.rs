@@ -17,7 +17,6 @@ use futures_util::stream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::convert::Infallible;
-use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 
 #[cfg(test)]
@@ -73,10 +72,9 @@ impl AppState {
         let old_manager = std::mem::replace(&mut *manager, new_manager.clone());
         drop(manager);
 
-        old_manager.kill_all().await;
+        old_manager.shutdown_all().await;
         old_manager.abort_health_tasks();
         old_manager.abort_watch_tasks();
-        tokio::time::sleep(Duration::from_millis(300)).await;
         new_manager.start_all().await;
         spawn_health_checkers(&new_manager, &self.http_client).await;
         spawn_watch_tasks(&new_manager).await;
@@ -88,7 +86,7 @@ impl AppState {
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         let manager = self.current_manager().await;
-        manager.kill_all().await;
+        manager.shutdown_all().await;
         manager.abort_health_tasks();
         manager.abort_watch_tasks();
     }

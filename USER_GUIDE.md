@@ -79,12 +79,15 @@ On each card you can usually see:
 - Its access point when one is configured, such as a local UI URL, port, or operator hint.
 - Whether the app is currently enabled or disabled.
 - Whether it is running, stopped, exited, or unhealthy.
+- Whether Rally thinks it is already running externally.
 - Its process ID while running.
 - Restart count.
 - Uptime.
 - Quick actions such as restart or kill.
 
 When an app is disabled, Rally shows that clearly in the card and Info view. A disabled app is different from an app that merely exited.
+
+If an app shows `external`, Rally found the expected local listener already responding before it launched the process. In practice that usually means the app is already running outside Rally and Rally deliberately did not start a duplicate.
 
 Selecting an app opens more detail, including logs, environment values, and operational information.
 

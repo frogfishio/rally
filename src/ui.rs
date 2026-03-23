@@ -131,6 +131,7 @@ pub fn dashboard_html() -> &'static str {
   .state-dot.pending { background: var(--yellow); }
   .state-dot.installing { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
   .state-dot.disabled { background: var(--text-dim); }
+  .state-dot.external { background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
   .state-dot.failed  { background: var(--red); }
   .state-dot.killed  { background: var(--text-dim); }
   .state-dot.exited  { background: var(--orange); }
@@ -163,6 +164,7 @@ pub fn dashboard_html() -> &'static str {
   .badge.pending   { background: #440; color: var(--yellow); }
   .badge.installing { background: #033; color: var(--accent); }
   .badge.disabled  { background: #222; color: var(--text-dim); }
+  .badge.external  { background: #24194d; color: #b7a8ff; }
   .badge.failed    { background: #400; color: var(--red); }
   .badge.killed    { background: #222; color: var(--text-dim); }
   .badge.exited    { background: #320; color: var(--orange); }
@@ -447,6 +449,7 @@ function renderInfoTable(proc) {
     <tr><td>PID</td><td>${proc.pid || '—'}</td></tr>
     <tr><td>Restarts</td><td>${proc.restart_count}</td></tr>
     <tr><td>Last restart</td><td>${proc.last_restart_reason ? escHtml(proc.last_restart_reason) : '—'}</td></tr>
+    <tr><td>Last error</td><td>${proc.last_error ? escHtml(proc.last_error) : '—'}</td></tr>
     <tr><td>Started</td><td>${fmtTs(proc.started_at)}</td></tr>
     <tr><td>Uptime</td><td>${proc.started_at && sc === 'running' ? elapsedSince(proc.started_at) : '—'}</td></tr>
     <tr><td>Exit time</td><td>${fmtTs(proc.exit_time)}</td></tr>
