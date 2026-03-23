@@ -8,6 +8,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -323,7 +324,7 @@ fn resolve_base_env(
         return Ok((process_env.clone(), HashMap::new(), None));
     };
 
-    let (provider_env, info) = execute_env_command(env_command, config_dir, telemetry)?;
+    let (provider_env, info) = execute_env_command(env_command, config_dir, telemetry, process_env)?;
 
     let mut base_env = if env_command.override_existing {
         process_env.clone()
@@ -364,6 +365,7 @@ fn execute_env_command(
     env_command: &EnvCommandConfig,
     config_dir: Option<&Path>,
     telemetry: Option<&TelemetrySink>,
+    process_env: &HashMap<String, String>,
 ) -> Result<(HashMap<String, String>, EnvProviderInfo)> {
     let workdir = resolve_env_command_workdir(env_command, config_dir)?;
     let command_for_spawn = resolve_env_command_path(&env_command.command, &workdir);
@@ -381,19 +383,21 @@ fn execute_env_command(
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(error) => {
+            let error_message = format_env_command_spawn_error(
+                &command_display,
+                env_command,
+                process_env,
+                &error,
+            );
             emit_env_command_failed(
                 telemetry,
                 &command_display,
                 started_at.elapsed(),
                 true,
                 None,
-                &error.to_string(),
+                &error_message,
             );
-            return Err(anyhow::anyhow!(
-                "env_command {} failed to start: {}",
-                command_display,
-                error
-            ));
+            return Err(anyhow::anyhow!(error_message));
         }
     };
 
@@ -527,6 +531,38 @@ fn resolve_env_command_path(command: &str, workdir: &Path) -> PathBuf {
     } else {
         path
     }
+}
+
+fn format_env_command_spawn_error(
+    command_display: &str,
+    env_command: &EnvCommandConfig,
+    process_env: &HashMap<String, String>,
+    error: &std::io::Error,
+) -> String {
+    let mut message = format!("env_command {} failed to start: {}", command_display, error);
+
+    if error.kind() != ErrorKind::NotFound {
+        return message;
+    }
+
+    message.push_str(
+        ". env_command is executed directly without a shell, so shell-only PATH setup and ~ expansion do not apply",
+    );
+
+    if let Some(path) = process_env.get("PATH") {
+        message.push_str(&format!(". PATH={}", path));
+    } else {
+        message.push_str(". PATH is unset");
+    }
+
+    let command_path = Path::new(&env_command.command);
+    if command_path.components().count() == 1 {
+        message.push_str(
+            ". If the binary lives outside Rally's PATH, set env_command.command to an absolute path",
+        );
+    }
+
+    message
 }
 
 fn read_pipe<R>(mut reader: R) -> Result<Vec<u8>>
@@ -1226,6 +1262,31 @@ API_URL = "${BASE_URL}/v1"
         assert_eq!(with_override["SHARED"], "provider");
         assert_eq!(with_override["FROM_PROCESS"], "process");
         assert_eq!(with_override["FROM_PROVIDER"], "provider");
+    }
+
+    #[test]
+    fn env_command_not_found_error_mentions_path_and_direct_execution() {
+        let env_command = EnvCommandConfig {
+            command: "macrun".to_owned(),
+            args: vec!["env".to_owned()],
+            format: EnvCommandFormat::Shell,
+            timeout_ms: 5_000,
+            workdir: None,
+            override_existing: false,
+        };
+        let process_env = HashMap::from([("PATH".to_owned(), "/usr/bin".to_owned())]);
+        let error = std::io::Error::from(ErrorKind::NotFound);
+
+        let message = format_env_command_spawn_error(
+            "macrun env",
+            &env_command,
+            &process_env,
+            &error,
+        );
+
+        assert!(message.contains("without a shell"));
+        assert!(message.contains("PATH=/usr/bin"));
+        assert!(message.contains("absolute path"));
     }
 
     #[cfg(unix)]
