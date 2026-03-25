@@ -1362,11 +1362,12 @@ API_URL = "${BASE_URL}/v1"
         };
         let process_env = HashMap::from([("PATH".to_owned(), "/usr/bin".to_owned())]);
         let error = std::io::Error::from(ErrorKind::NotFound);
+        let existing_workdir = std::env::current_dir().unwrap();
 
         let message = format_env_command_spawn_error(
             "macrun env",
             &env_command,
-            Path::new("/tmp"),
+            &existing_workdir,
             &process_env,
             &error,
         );
@@ -1403,11 +1404,12 @@ API_URL = "${BASE_URL}/v1"
             override_existing: false,
         };
         let error = std::io::Error::from(ErrorKind::NotFound);
+        let existing_workdir = std::env::current_dir().unwrap();
 
         let message = format_env_command_spawn_error(
             "missing env",
             &env_command,
-            Path::new("/tmp"),
+            &existing_workdir,
             &HashMap::new(),
             &error,
         );
