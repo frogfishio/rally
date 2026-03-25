@@ -126,6 +126,7 @@ pub fn router(state: SharedAppState) -> Router {
         .route("/api/enable/{name}", post(enable_handler))
         .route("/api/disable/{name}", post(disable_handler))
         .route("/api/kill/{name}", post(kill_handler))
+        .route("/api/recheck/{name}", post(recheck_handler))
         .route("/api/restart/{name}", post(restart_handler))
         .route("/api/reload", post(reload_handler))
         .route("/api/clear-logs/{name}", post(clear_logs_handler))
@@ -204,6 +205,14 @@ async fn kill_handler(
         }
     }
     StatusCode::NOT_FOUND
+}
+
+async fn recheck_handler(
+    Path(name): Path<String>,
+    State(state): State<SharedAppState>,
+) -> impl IntoResponse {
+    let mgr = state.current_manager().await;
+    control_status(mgr.restart_by_name(&name, "manual recheck").await)
 }
 
 async fn restart_handler(

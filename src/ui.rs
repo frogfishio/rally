@@ -312,6 +312,10 @@ async function actionKill(name) {
   await fetch('/api/kill/' + encodeURIComponent(name), { method: 'POST' });
 }
 
+async function actionRecheck(name) {
+  await fetch('/api/recheck/' + encodeURIComponent(name), { method: 'POST' });
+}
+
 async function actionRestart(name) {
   await fetch('/api/restart/' + encodeURIComponent(name), { method: 'POST' });
 }
@@ -436,7 +440,11 @@ function renderInfoTable(proc) {
   const envProviderLoadedAt = envProvider && envProvider.loaded_at
     ? fmtTs(envProvider.loaded_at)
     : '—';
+  const ownership = sc === 'external'
+    ? '<p class="empty-msg">Rally detected a reachable external service for this app, but does not own its process and cannot kill or adopt it.</p>'
+    : '';
   return `
+  ${ownership}
   <table class="info-table">
     <tr><td>State</td><td><span class="badge ${sc}">${stateLabel(proc.state)}</span></td></tr>
     <tr><td>Enabled</td><td>${proc.enabled ? 'true' : 'false'}</td></tr>
@@ -479,6 +487,17 @@ function renderCard(proc) {
   const accessTitle = proc.access ? proc.access : cmdFull;
   const isEnabled = proc.enabled !== false;
   const isRunning = sc === 'running';
+  const isExternal = sc === 'external';
+  const primaryAction = !isEnabled
+    ? `<button class="btn primary" onclick="enableProc('${escAttr(proc.name)}')">enable</button>`
+    : isRunning
+      ? `<button class="btn danger" onclick="killProc('${escAttr(proc.name)}')">kill</button>`
+      : isExternal
+        ? `<button class="btn primary" onclick="recheckProc('${escAttr(proc.name)}')">recheck</button>`
+        : `<button class="btn primary" onclick="restartProc('${escAttr(proc.name)}')">start</button>`;
+  const secondaryAction = isEnabled && !isExternal
+    ? `<button class="btn" onclick="restartProc('${escAttr(proc.name)}')">restart</button>`
+    : '';
 
   return `
   <div class="process-card${sel ? ' selected' : ''}" id="card-${slugify(proc.name)}">
@@ -491,12 +510,8 @@ function renderCard(proc) {
       ${proc.health !== 'not_configured' ? `<span class="badge ${hc}">${proc.health}</span>` : ''}
       <div class="process-meta">${isRunning && proc.started_at ? elapsedSince(proc.started_at) : ''}</div>
       <div class="process-actions" onclick="event.stopPropagation()">
-        ${isEnabled
-          ? (isRunning
-              ? `<button class="btn danger" onclick="killProc('${escAttr(proc.name)}')">kill</button>`
-              : `<button class="btn primary" onclick="restartProc('${escAttr(proc.name)}')">start</button>`)
-          : `<button class="btn primary" onclick="enableProc('${escAttr(proc.name)}')">enable</button>`}
-        ${isEnabled ? `<button class="btn" onclick="restartProc('${escAttr(proc.name)}')">restart</button>` : ''}
+        ${primaryAction}
+        ${secondaryAction}
         ${isEnabled ? `<button class="btn" onclick="disableProc('${escAttr(proc.name)}')">disable</button>` : ''}
       </div>
     </div>
@@ -572,6 +587,11 @@ async function clearLogs(name) {
 
 async function killProc(name) {
   await actionKill(name);
+  refresh();
+}
+
+async function recheckProc(name) {
+  await actionRecheck(name);
   refresh();
 }
 
